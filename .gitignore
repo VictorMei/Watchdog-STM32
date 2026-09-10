@@ -1,0 +1,10 @@
+build
+Debug
+mx.scratch
+!.settings
+*.elf
+*.hex
+*.bin
+*.map
+.DS_Store
+.pytest_cache
