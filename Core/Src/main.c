@@ -27,7 +27,6 @@
 #define HAL_UART_Transmit(...) do { } while (0)
 
 /* USER CODE END Includes */
-
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum
@@ -47,7 +46,34 @@ typedef enum
 #define MPU6050_WHO_AM_I      0x75
 #define MPU6050_PWR_MGMT_1    0x6B
 #define MPU6050_ACCEL_XOUT_H  0x3B
-#define PAN_KP                2.0f
+/* PAN_SIGN = +1 because increasing PWM moves camera RIGHT (confirmed via calibration test),
+   so positive err_x (target right of center) must increase pan pulse. */
+#define PAN_SIGN              1.0f
+/* TILT_SIGN = +1 because increasing PWM moves camera DOWN (confirmed via calibration test),
+   so positive err_y (target below center) must increase tilt pulse. */
+#define TILT_SIGN             1.0f
+#define PAN_GAIN              0.20f
+#define TILT_GAIN             0.18f
+#define PAN_DELTA_MAX_US      60.0f  /* max pulse change per 20 ms control update */
+#define TILT_DELTA_MAX_US     50.0f  /* max pulse change per 20 ms control update */
+#define DEADBAND_PX           20.0f
+#define PAN_PULSE_MIN_US      700.0f
+#define PAN_PULSE_MAX_US      2300.0f
+/* Narrowed to a safe +/-400us window around the corrected 1500us mechanical center.
+   Widen only after confirming these do not bind against the physical stops. */
+#define TILT_PULSE_MIN_US     1100.0f
+#define TILT_PULSE_MAX_US     1900.0f
+#define FAILSAFE_TIMEOUT_MS   250U
+#define CONTROL_PERIOD_MS     20U
+#define PAN_CENTER_US         1500U /* Pan neutral/home position; change here only */
+#define TILT_CENTER_US        1500U /* Tilt neutral/home position (mechanically corrected); change here only */
+#define PAN_TRIM_US           0     /* Mechanical trim: adjust +/- until pan horn sits level at boot */
+#define TILT_TRIM_US          0     /* Mechanical trim: adjust +/- until tilt sits level at boot; used only to set the startup center, never re-applied during tracking */
+#define SERVO_HOME_SETTLE_MS  200U  /* Time to hold neutral before any tracking command is honored */
+#define MPU6050_POLLING_ENABLED 1   /* Set to 0 to fully disable IMU I2C/UART traffic while isolating tracking latency */
+#define VERBOSE_DEBUG         0     /* Set to 1 to re-enable the IMU string + byte-counter UART prints */
+#define UART_DIAG_MODE        0     /* Set to 1 to disable servo movement and print RAW X/Y/AGE at 5 Hz for wiring/sign validation */
+#define CALIBRATION_MODE      0     /* Set to 1 to disable tracking and run the PAN/TILT 1500->1600us direction test (see main()) */
 
 /* USER CODE END PD */
 
@@ -73,11 +99,28 @@ static uint8_t uart_rx_length;
 static uint8_t uart_rx_index;
 static uint8_t uart_rx_checksum;
 static uint8_t uart_rx_payload[4];
+#if VERBOSE_DEBUG
 static uint32_t last_uart_debug_tick;
-static uint16_t pan_pulse_us = 1500U;
+#endif
+static float pan_pulse_us = (float)PAN_CENTER_US;
+static float tilt_pulse_us = (float)TILT_CENTER_US;
 static float filtered_err_x = 0.0f;
-static uint32_t last_pan_update_tick;
+static float filtered_err_y = 0.0f;
+static float last_delta_pan = 0.0f;
+static float last_delta_tilt = 0.0f;
+static uint32_t last_control_tick;
+static uint32_t last_diag_tick;
+static uint32_t last_mpu_led_tick;
 static uint32_t last_imu_tick;
+static uint8_t tracking_ready = 0;
+
+/* Phase 7: communication health counters. */
+static uint32_t last_pps_window_tick;
+static uint32_t pps_window_start_count;
+static uint32_t packets_per_second;
+static uint32_t last_packet_age;
+static uint32_t max_packet_age;
+static uint32_t last_comm_report_tick;
 
 volatile int16_t target_err_x;
 volatile int16_t target_err_y;
@@ -148,6 +191,81 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  /* Report the reset cause once so a brownout/watchdog reset (e.g. from a stalled servo at its
+     end-of-travel limit) is visible in the serial log instead of looking like a tracking reversal. */
+  {
+    int length = snprintf(uart_buffer, sizeof(uart_buffer),
+                          "BOOT reset flags: POR=%d PIN=%d SFT=%d IWDG=%d WWDG=%d LPWR=%d\r\n",
+                          __HAL_RCC_GET_FLAG(RCC_FLAG_PORRST) ? 1 : 0,
+                          __HAL_RCC_GET_FLAG(RCC_FLAG_PINRST) ? 1 : 0,
+                          __HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) ? 1 : 0,
+                          __HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) ? 1 : 0,
+                          __HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST) ? 1 : 0,
+                          __HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST) ? 1 : 0);
+    if (length > 0)
+    {
+      uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100);
+    }
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+  }
+
+  /* Start PWM before the I2C probe so servos move even if the IMU bus is stuck/disconnected. */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  /* Startup center only: drive both channels directly to their (trimmed) neutral position.
+     Do NOT re-apply this during tracking - trim only defines where pan/tilt begin. */
+  pan_pulse_us = (float)(PAN_CENTER_US + PAN_TRIM_US);
+  tilt_pulse_us = (float)(TILT_CENTER_US + TILT_TRIM_US);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)pan_pulse_us);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)tilt_pulse_us);
+
+  /* Hold neutral and discard any stray/garbage packets received during power-up settling. */
+  HAL_Delay(SERVO_HOME_SETTLE_MS);
+  new_target_data = 0;
+  filtered_err_x = 0.0f;
+  filtered_err_y = 0.0f;
+  last_valid_packet_tick = HAL_GetTick();
+  tracking_ready = 1;
+
+#if CALIBRATION_MODE
+  /* Direction calibration only: vision tracking never runs in this build. Watch the camera
+     physically at each step and use the observed direction to set PAN_SIGN / TILT_SIGN above. */
+  {
+    int length;
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
+    length = snprintf(uart_buffer, sizeof(uart_buffer), "CAL PAN=1500us (neutral)\r\n");
+    if (length > 0) { uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100); }
+    HAL_Delay(2000);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1600U);
+    length = snprintf(uart_buffer, sizeof(uart_buffer), "CAL PAN=1600us - observe LEFT or RIGHT\r\n");
+    if (length > 0) { uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100); }
+    HAL_Delay(3000);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)PAN_CENTER_US);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
+    length = snprintf(uart_buffer, sizeof(uart_buffer), "CAL TILT=1500us (neutral)\r\n");
+    if (length > 0) { uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100); }
+    HAL_Delay(2000);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1600U);
+    length = snprintf(uart_buffer, sizeof(uart_buffer), "CAL TILT=1600us - observe UP or DOWN\r\n");
+    if (length > 0) { uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100); }
+    HAL_Delay(3000);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)TILT_CENTER_US);
+  }
+  /* One-shot manual procedure: park at center and halt so tracking never runs with an
+     unverified sign. Re-flash with CALIBRATION_MODE 0 to resume normal tracking. */
+  while (1)
+  {
+    HAL_Delay(1000);
+  }
+#endif
+
+#if MPU6050_POLLING_ENABLED
   uint8_t who_am_i = 0;
   uint8_t wake_command = 0x00;
 
@@ -164,9 +282,7 @@ int main(void)
   {
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
   }
-
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pan_pulse_us);
+#endif
 
   /* USER CODE END 2 */
 
@@ -175,6 +291,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+#if MPU6050_POLLING_ENABLED
     if (mpu6050_ready && ((HAL_GetTick() - last_imu_tick) >= 100U))
     {
       last_imu_tick = HAL_GetTick();
@@ -182,6 +299,7 @@ int main(void)
                            I2C_MEMADD_SIZE_8BIT, mpu6050_data,
                            sizeof(mpu6050_data), 100) == HAL_OK)
       {
+#if VERBOSE_DEBUG
         int16_t accel_x = (int16_t)((mpu6050_data[0] << 8) | mpu6050_data[1]);
         int16_t accel_y = (int16_t)((mpu6050_data[2] << 8) | mpu6050_data[3]);
         int16_t accel_z = (int16_t)((mpu6050_data[4] << 8) | mpu6050_data[5]);
@@ -198,6 +316,7 @@ int main(void)
           uart_debug_transmit(&huart2, (uint8_t *)uart_buffer,
                               (uint16_t)length, 100);
         }
+#endif
       }
       else
       {
@@ -207,60 +326,165 @@ int main(void)
     }
     else if (!mpu6050_ready)
     {
-      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-      HAL_Delay(150);
+      /* Non-blocking heartbeat: the previous HAL_Delay(150) here stalled ALL tracking/UART
+         processing for 150 ms every pass whenever the IMU wasn't ready. That was a real bug. */
+      if ((HAL_GetTick() - last_mpu_led_tick) >= 150U)
+      {
+        last_mpu_led_tick = HAL_GetTick();
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+      }
     }
+#endif
 
     if (new_target_data == 1)
     {
       int16_t received_err_x = target_err_x;
       int16_t received_err_y = target_err_y;
-      int length;
 
       new_target_data = 0;
-      filtered_err_x = (0.4f * filtered_err_x) + (0.6f * (float)received_err_x);
+      /* Light filtering favors fresh data to minimize added lag. */
+      filtered_err_x = (0.15f * filtered_err_x) + (0.85f * (float)received_err_x);
+      filtered_err_y = (0.15f * filtered_err_y) + (0.85f * (float)received_err_y);
+    }
 
+    /* Phase 7: communication health, updated every pass, reported at 1 Hz only. */
+    last_packet_age = HAL_GetTick() - last_valid_packet_tick;
+    if (last_packet_age > max_packet_age)
+    {
+      max_packet_age = last_packet_age;
+    }
+    if ((HAL_GetTick() - last_pps_window_tick) >= 1000U)
+    {
+      last_pps_window_tick = HAL_GetTick();
+      packets_per_second = valid_frames_received - pps_window_start_count;
+      pps_window_start_count = valid_frames_received;
+    }
+    if ((HAL_GetTick() - last_comm_report_tick) >= 1000U)
+    {
+      int length;
+      last_comm_report_tick = HAL_GetTick();
       length = snprintf(uart_buffer, sizeof(uart_buffer),
-                        "RX err_x=%d err_y=%d\r\n",
-                        received_err_x, received_err_y);
+                        "COMM valid=%lu pps=%lu age=%lu maxAge=%lu\r\n",
+                        (unsigned long)valid_frames_received,
+                        (unsigned long)packets_per_second,
+                        (unsigned long)last_packet_age,
+                        (unsigned long)max_packet_age);
       if (length > 0)
       {
-        uart_debug_transmit(&huart2, (uint8_t *)uart_buffer,
-                            (uint16_t)length, 100);
+        uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100);
       }
+      max_packet_age = 0;
     }
 
-    if ((HAL_GetTick() - last_pan_update_tick) >= 20U &&
-        (HAL_GetTick() - last_valid_packet_tick) <= 500U)
+    if ((HAL_GetTick() - last_control_tick) >= CONTROL_PERIOD_MS)
     {
-      int16_t delta_us = 0;
-      last_pan_update_tick = HAL_GetTick();
+      uint8_t comm_ok = ((HAL_GetTick() - last_valid_packet_tick) <= FAILSAFE_TIMEOUT_MS) ? 1U : 0U;
+      last_control_tick = HAL_GetTick();
 
-      if (filtered_err_x > 15.0f || filtered_err_x < -15.0f)
+#if !UART_DIAG_MODE
+      if (tracking_ready && comm_ok)
       {
-        delta_us = (int16_t)(PAN_KP * filtered_err_x);
-        if (delta_us > 80)
+        last_delta_pan = 0.0f;
+        last_delta_tilt = 0.0f;
+
+        if (filtered_err_x > DEADBAND_PX || filtered_err_x < -DEADBAND_PX)
         {
-          delta_us = 80;
-        }
-        else if (delta_us < -80)
-        {
-          delta_us = -80;
+          float delta_pan = PAN_GAIN * filtered_err_x;
+          if (delta_pan > PAN_DELTA_MAX_US)
+          {
+            delta_pan = PAN_DELTA_MAX_US;
+          }
+          else if (delta_pan < -PAN_DELTA_MAX_US)
+          {
+            delta_pan = -PAN_DELTA_MAX_US;
+          }
+          last_delta_pan = delta_pan;
+          pan_pulse_us += PAN_SIGN * delta_pan;
         }
 
-        pan_pulse_us += delta_us;
-        if (pan_pulse_us < 700U)
+        if (filtered_err_y > DEADBAND_PX || filtered_err_y < -DEADBAND_PX)
         {
-          pan_pulse_us = 700U;
+          float delta_tilt = TILT_GAIN * filtered_err_y;
+          if (delta_tilt > TILT_DELTA_MAX_US)
+          {
+            delta_tilt = TILT_DELTA_MAX_US;
+          }
+          else if (delta_tilt < -TILT_DELTA_MAX_US)
+          {
+            delta_tilt = -TILT_DELTA_MAX_US;
+          }
+          last_delta_tilt = delta_tilt;
+          tilt_pulse_us += TILT_SIGN * delta_tilt;
         }
-        else if (pan_pulse_us > 2300U)
+
+        if (pan_pulse_us < PAN_PULSE_MIN_US)
         {
-          pan_pulse_us = 2300U;
+          pan_pulse_us = PAN_PULSE_MIN_US;
         }
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pan_pulse_us);
+        else if (pan_pulse_us > PAN_PULSE_MAX_US)
+        {
+          pan_pulse_us = PAN_PULSE_MAX_US;
+        }
+
+        if (tilt_pulse_us < TILT_PULSE_MIN_US)
+        {
+          tilt_pulse_us = TILT_PULSE_MIN_US;
+        }
+        else if (tilt_pulse_us > TILT_PULSE_MAX_US)
+        {
+          tilt_pulse_us = TILT_PULSE_MAX_US;
+        }
+
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)pan_pulse_us);
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)tilt_pulse_us);
       }
+      /* else: stale data or not yet homed - hold current positions, do not re-center. */
+#endif
     }
 
+#if UART_DIAG_MODE
+    /* Phase 2: raw wiring/sign validation only - servos are not commanded while this is enabled. */
+    if ((HAL_GetTick() - last_diag_tick) >= 200U)
+    {
+      int length;
+      uint32_t age_ms = HAL_GetTick() - last_valid_packet_tick;
+      last_diag_tick = HAL_GetTick();
+      length = snprintf(uart_buffer, sizeof(uart_buffer),
+                        "RAW X=%d Y=%d AGE=%lu\r\n",
+                        (int)target_err_x, (int)target_err_y,
+                        (unsigned long)age_ms);
+      if (length > 0)
+      {
+        uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100);
+      }
+    }
+#else
+    if ((HAL_GetTick() - last_diag_tick) >= 250U)
+    {
+      int length;
+      last_diag_tick = HAL_GetTick();
+
+      length = snprintf(uart_buffer, sizeof(uart_buffer),
+                        "X=%d FX=%.1f PAN_SIGN=%.0f DP=%.1f PAN=%.1f\r\n",
+                        (int)target_err_x, (double)filtered_err_x, (double)PAN_SIGN,
+                        (double)last_delta_pan, (double)pan_pulse_us);
+      if (length > 0)
+      {
+        uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100);
+      }
+
+      length = snprintf(uart_buffer, sizeof(uart_buffer),
+                        "Y=%d FY=%.1f TILT_SIGN=%.0f DT=%.1f TILT=%.1f\r\n",
+                        (int)target_err_y, (double)filtered_err_y, (double)TILT_SIGN,
+                        (double)last_delta_tilt, (double)tilt_pulse_us);
+      if (length > 0)
+      {
+        uart_debug_transmit(&huart2, (uint8_t *)uart_buffer, (uint16_t)length, 100);
+      }
+    }
+#endif
+
+#if VERBOSE_DEBUG
     if ((HAL_GetTick() - last_uart_debug_tick) >= 1000U)
     {
       int length = snprintf(uart_buffer, sizeof(uart_buffer),
@@ -275,6 +499,7 @@ int main(void)
                             (uint16_t)length, 100);
       }
     }
+#endif
 
     /* USER CODE BEGIN 3 */
   }
