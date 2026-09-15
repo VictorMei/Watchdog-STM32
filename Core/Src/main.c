@@ -273,6 +273,32 @@ typedef struct
                                         directly in the control path.  Code is preserved intact. */
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
 #define TRACKING_DEBUG        1      /* 1 = one compact non-blocking status line per second - ON to diagnose "nothing moves" */
+
+/* ---- Temporary L9110S drive-motor hardware test ---------------------------
+   1 = run a one-shot GPIO-only motor exercise at boot, then halt forever.
+   Set back to 0 to return to normal pan/tilt tracking - this must never be
+   left on for real operation, and none of its HAL_Delay() calls compile in
+   when it is off. */
+#define MOTOR_HARDWARE_TEST   1
+
+/* L9110S channel A ("A-1A"/"A-1B") drives one wheel, channel B ("B-1A"/"B-2A")
+   drives the other. Wiring per the current harness:
+     A-1A = PB10 (D6)   A-1B = PB5 (D4)
+     B-1A = PA9  (D8)   B-2A = PA8  (D7)
+   Both pins already come up as GPIO_MODE_OUTPUT_PP from MX_GPIO_Init(). */
+#define MOTOR_A_PORT_1        GPIOB
+#define MOTOR_A_PIN_1         GPIO_PIN_10   /* A-1A */
+#define MOTOR_A_PORT_2        GPIOB
+#define MOTOR_A_PIN_2         GPIO_PIN_5    /* A-1B */
+#define MOTOR_B_PORT_1        GPIOA
+#define MOTOR_B_PIN_1         GPIO_PIN_9    /* B-1A */
+#define MOTOR_B_PORT_2        GPIOA
+#define MOTOR_B_PIN_2         GPIO_PIN_8    /* B-2A */
+
+/* Flip either of these independently if that motor spins the wrong way for
+   the chassis - no need to touch motors_forward()/backward()/turn logic. */
+#define MOTOR_A_REVERSED      0
+#define MOTOR_B_REVERSED      0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -360,6 +386,14 @@ static float   axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtere
 static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
+#if MOTOR_HARDWARE_TEST
+static void    motors_stop(void);
+static void    motors_forward(void);
+static void    motors_backward(void);
+static void    motors_turn_left(void);
+static void    motors_turn_right(void);
+static void    motor_hardware_test_run(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -664,6 +698,105 @@ static void uart_rx_keepalive(void)
   }
   __set_PRIMASK(primask);
 }
+
+#if MOTOR_HARDWARE_TEST
+/* Simple two-wire L9110S channel: HIGH/LOW only, no PWM. One motor per channel. */
+typedef enum
+{
+  MOTOR_DIR_STOP = 0,
+  MOTOR_DIR_FWD,
+  MOTOR_DIR_BWD
+} motor_dir_t;
+
+static void motor_drive(GPIO_TypeDef *port1, uint16_t pin1,
+                        GPIO_TypeDef *port2, uint16_t pin2,
+                        motor_dir_t dir, uint8_t reversed)
+{
+  if (reversed && (dir != MOTOR_DIR_STOP))
+  {
+    dir = (dir == MOTOR_DIR_FWD) ? MOTOR_DIR_BWD : MOTOR_DIR_FWD;
+  }
+
+  switch (dir)
+  {
+    case MOTOR_DIR_FWD:
+      HAL_GPIO_WritePin(port1, pin1, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(port2, pin2, GPIO_PIN_RESET);
+      break;
+    case MOTOR_DIR_BWD:
+      HAL_GPIO_WritePin(port1, pin1, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(port2, pin2, GPIO_PIN_SET);
+      break;
+    default:
+      HAL_GPIO_WritePin(port1, pin1, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(port2, pin2, GPIO_PIN_RESET);
+      break;
+  }
+}
+
+/* Motor A = left side, Motor B = right side (swap the turn functions below if
+   that assumption is backwards for this chassis). */
+static void motors_stop(void)
+{
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_STOP, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_STOP, MOTOR_B_REVERSED);
+}
+
+static void motors_forward(void)
+{
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_B_REVERSED);
+}
+
+static void motors_backward(void)
+{
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_B_REVERSED);
+}
+
+static void motors_turn_left(void)
+{
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_B_REVERSED);
+}
+
+static void motors_turn_right(void)
+{
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_B_REVERSED);
+}
+
+/* One-shot bring-up sequence. HAL_Delay() is only ever used here - never in the
+   tracking loop - and this function halts forever afterward, so it cannot run
+   alongside normal pan/tilt/vision operation. */
+static void motor_hardware_test_run(void)
+{
+  motors_stop();        HAL_Delay(1000);
+  motors_forward();     HAL_Delay(2000);
+  motors_stop();        HAL_Delay(1000);
+  motors_backward();    HAL_Delay(2000);
+  motors_stop();        HAL_Delay(1000);
+  motors_turn_left();   HAL_Delay(1000);
+  motors_stop();        HAL_Delay(1000);
+  motors_turn_right();  HAL_Delay(1000);
+  motors_stop();
+
+  while (1)
+  {
+    /* Stop permanently: this is a one-shot hardware test, not normal operation. */
+  }
+}
+#endif /* MOTOR_HARDWARE_TEST */
 /* USER CODE END 0 */
 
 /**
@@ -696,6 +829,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   /* Report the reset cause once so a brownout/watchdog reset (e.g. from a stalled servo at its
@@ -709,6 +843,12 @@ int main(void)
                                __HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST) ? 1 : 0,
                                __HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST) ? 1 : 0));
   __HAL_RCC_CLEAR_RESET_FLAGS();
+
+#if MOTOR_HARDWARE_TEST
+  /* Temporary standalone drive-motor bring-up: runs once, then halts forever.
+     Pan/tilt homing and tracking below never run while this is enabled. */
+  motor_hardware_test_run();
+#endif
 
   /* ======================= HOMING / TRIM (trusted, unchanged) =======================
      Runs exactly once, before the control loop. The blocking delays here are boot-time
@@ -830,6 +970,52 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+    uint32_t now = HAL_GetTick();
+
+    /* Keep the vision link alive: a single UART overrun used to kill reception forever. */
+    uart_rx_keepalive();
+
+    /* -------- The one and only periodic control loop, fixed 20 ms, non-blocking -------- */
+    if ((now - last_control_tick) >= CONTROL_PERIOD_MS)
+    {
+      last_control_tick = now;
+      tracking_update(now);
+    }
+
+#if TRACKING_DEBUG
+    if ((now - pps_window_tick) >= 1000U)
+    {
+      pps_window_tick    = now;
+      packets_per_second = valid_frames_received - pps_window_start;
+      pps_window_start   = valid_frames_received;
+    }
+
+    if ((now - last_report_tick) >= 1000U)
+    {
+      last_report_tick = now;
+      /* gp/gt are the watchdog's gain scales in percent: a run of values below 100 is
+         the loop telling you it caught itself ringing on that axis. ifp is the pan
+         in-flight move in us - the correction already sent that the frame cannot show
+         yet, ift the same for tilt. up= is tilt's remaining UPWARD travel in us: if that
+         sits at 0 while ey stays negative, tilt is not ringing at all, it is pegged
+         against its top stop and physically cannot centre the target - that needs travel
+         (TILT_TRIM_US / the bracket), not tuning. The two look alike on camera and have
+         opposite fixes, so check this field before touching a gain. */
+      debug_send_async(snprintf(tx_buffer, sizeof(tx_buffer),
+                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d bad=%lu err=%lu\r\n",
+                                (unsigned long)packets_per_second,
+                                (unsigned long)(now - last_valid_packet_tick),
+                                (int)filtered_err_x, (int)filtered_err_y,
+                                (unsigned)pan_pulse_us, (unsigned)tilt_pulse_us,
+                                (unsigned)(pan_ctl.gain_scale * 100.0f),
+                                (unsigned)(tilt_ctl.gain_scale * 100.0f),
+                                (int)pan_ctl.inflight_us,
+                                (int)tilt_ctl.inflight_us,
+                                (int)(tilt_pulse_us - TILT_PULSE_MIN_US),
+                                (unsigned long)bad_checksum_count,
+                                (unsigned long)uart_error_count));
+    }
+#endif
 
     /* USER CODE BEGIN 3 */
   }
