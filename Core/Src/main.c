@@ -60,7 +60,21 @@ typedef enum
 /* ---- Hard travel limits. Every pulse written is clamped to these. ---------- */
 #define PAN_PULSE_MIN_US      700.0f
 #define PAN_PULSE_MAX_US      2300.0f
-#define TILT_PULSE_MIN_US     400.0f  /* NOTE: equals the current tilt neutral - see TILT_TRIM_US */
+/* MEASURED 2026-09-14: tilt tracks DOWN well but cannot look UP. Home sits at 500us and
+   "up" means DECREASING the pulse, so upward travel is whatever gap exists between home
+   and this floor - it was only 100us (~9 deg), effectively nothing. Lowered to 350us to
+   give ~150us (~13 deg) of real upward authority, enough to re-centre a target sitting in
+   the upper third of the frame.
+   IMPORTANT: 400.0f was never a measured servo limit - an earlier revision picked it purely
+   so that 2200-1800 came out even. The servo's true minimum is unknown, so this steps into
+   unverified territory deliberately and conservatively. If tilt BUZZES/HUMS at the top of
+   its travel, or the board resets while looking up (check the BOOT reset flags), the servo
+   is stalling against its internal stop - put this back to 400.0f. If it looks up cleanly
+   and you want more, 300.0f is the next step.
+   The honest ceiling: level sits near one end of this servo's travel, so ~1700us of unused
+   DOWNWARD range cannot be traded for upward range in software. Getting symmetric up/down
+   authority needs the tilt horn/bracket remounted, not a different constant. */
+#define TILT_PULSE_MIN_US     350.0f  /* was 400.0f - see note above */
 #define TILT_PULSE_MAX_US     2200.0f
 
 /* ---- Calibrated home position / trim.  TRUSTED - do not "tidy" these. ------
@@ -69,14 +83,24 @@ typedef enum
           by TILT_TRIM_US.  That makes the boot position repeatable regardless
           of where the horn powered up.  Applied ONCE at boot and never again;
           the tracking loop integrates away from it and never pulls back to it.
-   WARNING: 2200 - 1800 = 400us, which is exactly TILT_PULSE_MIN_US, so tilt
-          currently has ZERO travel left in the decreasing-pulse direction.
-          See the tilt range test in the report before trusting tilt tracking. */
+   MEASURED 2026-09-14 (serial boot log): with TILT_TRIM_US=1800 the home pulse landed at
+   exactly 400us = TILT_PULSE_MIN_US, so tilt had ZERO upward room and every "look up"
+   command clamped to a no-op. TILT_TRIM_US=1700 moves home to 500us.
+   Upward travel is the gap between home and TILT_PULSE_MIN_US, so it is bought from TWO
+   places and both have now been used: home moved up 100us (here), and the floor moved
+   down 50us (TILT_PULSE_MIN_US, 400->350). Net upward room is ~150us.
+   Prefer moving the FLOOR over moving HOME when more is needed: lowering TILT_TRIM_US
+   further tilts the boot framing progressively downward, which costs you the ability to
+   see a standing person at all. Watch for servo strain either way - see the note on
+   TILT_PULSE_MIN_US above.
+   Hard limit worth knowing: "level" sits near one end of this servo's travel, leaving
+   ~1700us of DOWNWARD range that is useless and cannot be traded for upward range in
+   software. Symmetric up/down authority requires remounting the horn/bracket. */
 #define PAN_CENTER_US         1500U
 #define PAN_TRIM_US           0
 #define TILT_CENTER_US        1500U  /* reference only; tilt neutral is derived from the bottom stop */
 #define TILT_BOTTOM_US        TILT_PULSE_MAX_US /* Confirmed: increasing pulse tilts down; this is the down limit */
-#define TILT_TRIM_US          1800   /* Distance to move UP from the bottom limit to reach visual centre */
+#define TILT_TRIM_US          1700   /* was 1800; home 400->500us. With the 350us floor: ~150us up-room */
 #define TILT_BOTTOM_HOLD_MS   300U   /* Hold at the bottom limit before moving to the trimmed centre */
 #define SERVO_HOME_SETTLE_MS  200U   /* Hold neutral before any tracking command is honoured */
 
@@ -86,12 +110,23 @@ typedef enum
    Required end behaviour:
        target right (err_x>0) -> camera pans right
        target below (err_y>0) -> camera tilts down                            */
-#define PAN_SIGN             -1.0f   /* MEASURED 2026-09-14: increasing pulse pans LEFT, so err_x>0 must DECREASE the pulse */
-#define TILT_SIGN             1.0f   /* MEASURED 2026-09-14: correct as-is, tilt follows the target */
+#define PAN_SIGN             -1.0f   /* CONFIRMED on hardware: converges on the target (it rang around it
+                                        rather than running away), so this sign is correct. Do not flip it. */
+#define TILT_SIGN             1.0f   /* CONFIRMED on hardware: tilt tracks downward correctly. */
 
 /* ---- Incremental proportional controller (no integral, no derivative) ------ */
-#define PAN_GAIN              0.20f  /* us of pulse per pixel of error, per accepted sample */
-#define TILT_GAIN             0.18f
+/* MEASURED 2026-09-14: pan rang (right-left-right-left) around a target it had already
+   reached, while tilt at 0.18f/35px was stable. That asymmetry is the whole diagnosis -
+   a wrong SIGN runs away and never returns, but ringing around the correct position is a
+   delay-driven limit cycle. The vision pipeline (capture -> inference -> serial) is
+   roughly 150-200 ms behind, so at 15 fps the controller applies ~3 more corrections
+   after it has physically arrived, using an error that is already stale. Overshoot per
+   swing is approximately (loop delay in samples) x (fraction of the error cancelled per
+   sample); cutting the gain cuts that product directly. 0.12f keeps ~0.3 - comfortably
+   damped - while still closing a 200 px error in about a second.
+   If this feels sluggish, raise toward 0.16f. Do NOT go back above 0.18f. */
+#define PAN_GAIN              0.12f  /* was 0.20f - see note above */
+#define TILT_GAIN             0.18f  /* leave alone: this axis is confirmed stable */
 #define PAN_DELTA_MAX_US      60.0f  /* safety cap on one step, so a bad frame cannot lurch */
 #define TILT_DELTA_MAX_US     50.0f
 /* Dead-zone half-width, per axis. Must be WIDER than the frame-to-frame noise on that
@@ -99,7 +134,8 @@ typedef enum
    camera visibly hunts on a stationary target. A person's bounding box is markedly noisier
    vertically than horizontally (posture, limbs, box height), so tilt needs a wider band.
    Tune from the TRACKING_DEBUG ex=/ey= fields: pick a little above the resting spread. */
-#define PAN_DEADBAND_PX       20.0f
+#define PAN_DEADBAND_PX       35.0f  /* was 20.0f; widened to match the stable tilt axis, so the
+                                        residual ring settles instead of hunting forever */
 #define TILT_DEADBAND_PX      35.0f
 #define ERR_FILTER_OLD        0.15f  /* light filter only - heavy filtering is pure added lag */
 #define ERR_FILTER_NEW        0.85f
@@ -110,7 +146,7 @@ typedef enum
 #define MPU6050_POLLING_ENABLED 0    /* 0 while validating tracking: the blocking I2C read sat
                                         directly in the control path.  Code is preserved intact. */
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
-#define TRACKING_DEBUG        0      /* 1 = one compact non-blocking status line per second */
+#define TRACKING_DEBUG        1      /* 1 = one compact non-blocking status line per second - ON to diagnose "nothing moves" */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
