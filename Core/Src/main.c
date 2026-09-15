@@ -311,8 +311,17 @@ typedef struct
    backward when motors_forward() runs, or spins in place instead of driving
    straight, fix the flags here - never the helper functions. */
 #define LEFT_MOTOR_IS_MOTOR_A 1      /* 0 if Motor B is physically the left wheel */
-#define MOTOR_LEFT_REVERSED   0      /* 1 if the left wheel spins backward when driven forward */
-#define MOTOR_RIGHT_REVERSED  0      /* 1 if the right wheel spins backward when driven forward */
+#define MOTOR_LEFT_REVERSED   0      /* 1 if ONLY the left wheel spins backward when driven forward */
+#define MOTOR_RIGHT_REVERSED  0      /* 1 if ONLY the right wheel spins backward when driven forward */
+
+/* Bring-up test result: motors_forward()/backward() drove the car backward/
+   forward respectively, while motors_turn_left()/turn_right() already pivot
+   the correct way. That is NOT the same fault as one wheel being reversed -
+   turning depends on the two wheels disagreeing, straight-line motion
+   depends on them agreeing, so flipping MOTOR_LEFT/RIGHT_REVERSED together
+   would fix forward/backward but break the (already-correct) turns. This
+   flag swaps ONLY the straight-line functions and leaves turning alone. */
+#define MOTORS_FWD_BWD_SWAPPED 1
 
 #if LEFT_MOTOR_IS_MOTOR_A
 #define MOTOR_LEFT_PORT_1     MOTOR_A_PORT_1
@@ -784,18 +793,28 @@ static void motors_stop(void)
 
 static void motors_forward(void)
 {
+#if MOTORS_FWD_BWD_SWAPPED
+  const motor_dir_t straight_dir = MOTOR_DIR_BWD;
+#else
+  const motor_dir_t straight_dir = MOTOR_DIR_FWD;
+#endif
   motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_LEFT_REVERSED);
+             straight_dir, MOTOR_LEFT_REVERSED);
   motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_RIGHT_REVERSED);
+             straight_dir, MOTOR_RIGHT_REVERSED);
 }
 
 static void motors_backward(void)
 {
+#if MOTORS_FWD_BWD_SWAPPED
+  const motor_dir_t straight_dir = MOTOR_DIR_FWD;
+#else
+  const motor_dir_t straight_dir = MOTOR_DIR_BWD;
+#endif
   motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_LEFT_REVERSED);
+             straight_dir, MOTOR_LEFT_REVERSED);
   motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_RIGHT_REVERSED);
+             straight_dir, MOTOR_RIGHT_REVERSED);
 }
 
 /* Pivot left: left wheel backward, right wheel forward. */
