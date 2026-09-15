@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 /* USER CODE END Includes */
+
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum
@@ -280,8 +281,6 @@ typedef struct
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-I2C_HandleTypeDef hi2c1;
-
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart2;
@@ -347,7 +346,6 @@ static uint32_t last_mpu_led_tick;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
@@ -697,9 +695,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_I2C1_Init();
   MX_USART2_UART_Init();
-  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   /* Report the reset cause once so a brownout/watchdog reset (e.g. from a stalled servo at its
@@ -834,79 +830,6 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    uint32_t now = HAL_GetTick();
-
-    /* Keep the vision link alive: a single UART overrun used to kill reception forever. */
-    uart_rx_keepalive();
-
-#if MPU6050_POLLING_ENABLED
-    /* Preserved for later stabilisation work. NOTE: HAL_I2C_Mem_Read is blocking with a
-       100 ms timeout and sits directly in front of the control update, so it is a real
-       latency source. Keep MPU6050_POLLING_ENABLED at 0 until tracking is validated. */
-    if (mpu6050_ready && ((now - last_imu_tick) >= 100U))
-    {
-      last_imu_tick = now;
-      if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDRESS, MPU6050_ACCEL_XOUT_H,
-                           I2C_MEMADD_SIZE_8BIT, mpu6050_data,
-                           sizeof(mpu6050_data), 100) != HAL_OK)
-      {
-        mpu6050_ready = 0;
-      }
-    }
-    else if (!mpu6050_ready)
-    {
-      /* Non-blocking heartbeat: the previous HAL_Delay(150) here stalled ALL tracking/UART
-         processing for 150 ms every pass whenever the IMU wasn't ready. That was a real bug
-         and must not come back. */
-      if ((now - last_mpu_led_tick) >= 150U)
-      {
-        last_mpu_led_tick = now;
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-      }
-    }
-#endif
-
-    /* -------- The one and only periodic control loop, fixed 20 ms, non-blocking -------- */
-    if ((now - last_control_tick) >= CONTROL_PERIOD_MS)
-    {
-      last_control_tick = now;
-      tracking_update(now);
-    }
-
-#if TRACKING_DEBUG
-    if ((now - pps_window_tick) >= 1000U)
-    {
-      pps_window_tick    = now;
-      packets_per_second = valid_frames_received - pps_window_start;
-      pps_window_start   = valid_frames_received;
-    }
-
-    if ((now - last_report_tick) >= 1000U)
-    {
-      last_report_tick = now;
-      /* gp/gt are the watchdog's gain scales in percent: a run of values below 100 is
-         the loop telling you it caught itself ringing on that axis. ifp is the pan
-         in-flight move in us - the correction already sent that the frame cannot show
-         yet, ift the same for tilt. up= is tilt's remaining UPWARD travel in us: if that
-         sits at 0 while ey stays negative, tilt is not ringing at all, it is pegged
-         against its top stop and physically cannot centre the target - that needs travel
-         (TILT_TRIM_US / the bracket), not tuning. The two look alike on camera and have
-         opposite fixes, so check this field before touching a gain. */
-      debug_send_async(snprintf(tx_buffer, sizeof(tx_buffer),
-                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d bad=%lu err=%lu\r\n",
-                                (unsigned long)packets_per_second,
-                                (unsigned long)(now - last_valid_packet_tick),
-                                (int)filtered_err_x, (int)filtered_err_y,
-                                (unsigned)pan_pulse_us, (unsigned)tilt_pulse_us,
-                                (unsigned)(pan_ctl.gain_scale * 100.0f),
-                                (unsigned)(tilt_ctl.gain_scale * 100.0f),
-                                (int)pan_ctl.inflight_us,
-                                (int)tilt_ctl.inflight_us,
-                                (int)(tilt_pulse_us - TILT_PULSE_MIN_US),
-                                (unsigned long)bad_checksum_count,
-                                (unsigned long)uart_error_count));
-    }
-#endif
 
     /* USER CODE BEGIN 3 */
   }
@@ -947,24 +870,6 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-static void MX_I2C1_Init(void)
-{
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1074,14 +979,33 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10|GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PA5 PA8 PA9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_8|GPIO_PIN_9;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB10 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB8 PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure peripheral I/O remapping */
+  __HAL_AFIO_REMAP_I2C1_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
