@@ -279,7 +279,7 @@ typedef struct
    Set back to 0 to return to normal pan/tilt tracking - this must never be
    left on for real operation, and none of its HAL_Delay() calls compile in
    when it is off. */
-#define MOTOR_HARDWARE_TEST   1
+#define MOTOR_HARDWARE_TEST   0
 
 /* L9110S channel A ("A-1A"/"A-1B") drives one wheel, channel B ("B-1A"/"B-2A")
    drives the other. Wiring per the current harness:
@@ -776,20 +776,45 @@ static void motors_turn_right(void)
              MOTOR_DIR_BWD, MOTOR_B_REVERSED);
 }
 
-/* One-shot bring-up sequence. HAL_Delay() is only ever used here - never in the
-   tracking loop - and this function halts forever afterward, so it cannot run
-   alongside normal pan/tilt/vision operation. */
+/* One-shot channel-isolation test: drives Motor A alone, then Motor B alone,
+   then both together, so a "only one wheel turns" symptom can be attributed
+   to one L9110S channel/motor instead of the shared code path. HAL_Delay() is
+   only ever used here - never in the tracking loop - and this function halts
+   forever afterward, so it cannot run alongside normal pan/tilt/vision
+   operation. */
 static void motor_hardware_test_run(void)
 {
-  motors_stop();        HAL_Delay(1000);
-  motors_forward();     HAL_Delay(2000);
-  motors_stop();        HAL_Delay(1000);
-  motors_backward();    HAL_Delay(2000);
-  motors_stop();        HAL_Delay(1000);
-  motors_turn_left();   HAL_Delay(1000);
-  motors_stop();        HAL_Delay(1000);
-  motors_turn_right();  HAL_Delay(1000);
-  motors_stop();
+  /* Phase 1: Motor A only, forward.
+       A-1A (PB10) = HIGH, A-1B (PB5) = LOW   -> Motor A forward
+       B-1A (PA9)  = LOW,  B-2A (PA8) = LOW   -> Motor B held stopped */
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_STOP, MOTOR_B_REVERSED);
+  HAL_Delay(2000);
+
+  motors_stop();         /* all four pins LOW */
+  HAL_Delay(1000);
+
+  /* Phase 2: Motor B only, forward.
+       A-1A (PB10) = LOW,  A-1B (PB5) = LOW   -> Motor A held stopped
+       B-1A (PA9)  = HIGH, B-2A (PA8) = LOW   -> Motor B forward */
+  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
+             MOTOR_DIR_STOP, MOTOR_A_REVERSED);
+  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_B_REVERSED);
+  HAL_Delay(2000);
+
+  motors_stop();         /* all four pins LOW */
+  HAL_Delay(1000);
+
+  /* Phase 3: both motors, forward.
+       A-1A (PB10) = HIGH, A-1B (PB5) = LOW   -> Motor A forward
+       B-1A (PA9)  = HIGH, B-2A (PA8) = LOW   -> Motor B forward */
+  motors_forward();
+  HAL_Delay(2000);
+
+  motors_stop();         /* all four pins LOW, permanently */
 
   while (1)
   {
