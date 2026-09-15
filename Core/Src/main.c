@@ -47,6 +47,23 @@ typedef struct
   int8_t   err_sign;         /* which side of centre the error was on last sample */
 } axis_ctl_t;
 
+/* Everything that differs between pan and tilt, in ONE place. This exists because of the
+   2026-09-15 bug: tilt was running at 1.5x pan's gain with 2/3 of its damping and a
+   per-step cap nine times larger relative to its own travel, and none of that was visible
+   while the constants were scattered down the file and passed positionally. Put a new
+   axis difference here or not at all. */
+typedef struct
+{
+  float   sign;           /* direction calibration, +/-1.0f */
+  float   gain;           /* us of pulse per pixel of error */
+  float   damp;           /* fraction of the in-flight move discounted per step */
+  float   band_px;        /* dead-zone half-width */
+  float   delta_max_us;   /* cap on one step - read it against pulse_max - pulse_min */
+  float   pulse_min_us;
+  float   pulse_max_us;
+  uint8_t ring_trip;      /* fast non-decaying half-cycles tolerated before backing off */
+} axis_cfg_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -144,10 +161,29 @@ typedef struct
    trading tracking speed away. Because that damping also discounts the large-error
    approach, this is now the one case where 0.16f is worth trying if acquisition feels
    slow - but change PAN_DAMP first and only one of the two at a time. */
+/* MEASURED 2026-09-15: with pan fixed, TILT became the axis that rings and loses the
+   target - and it rings on VERTICAL STEP CHANGES specifically. "Tilt is confirmed
+   stable" was true but misleading: it was never actually stress-tested. Home sits near
+   the top of this servo's useful range, most targets sit BELOW centre, and with only
+   ~150us of up-room every upward correction hit the travel clamp instead of ringing.
+   A clamp looks like stability. It is not - it is an axis that never got to overshoot.
+   The dead time (150-200 ms of capture -> inference -> serial) belongs to the VISION
+   PIPELINE, not to an axis, so both axes face the same stability margin and there was
+   never a reason tilt could live at 1.5x pan's gain with 2/3 of pan's damping. It is
+   now matched to the values confirmed on pan. */
 #define PAN_GAIN              0.12f  /* was 0.20f - see note above */
-#define TILT_GAIN             0.18f  /* leave alone: this axis is confirmed stable */
+#define TILT_GAIN             0.12f  /* was 0.18f - matched to pan; same loop, same dead time */
 #define PAN_DELTA_MAX_US      60.0f  /* safety cap on one step, so a bad frame cannot lurch */
-#define TILT_DELTA_MAX_US     50.0f
+/* The per-step cap has to be read against the travel the axis actually HAS, and this is
+   where tilt was quietly extreme. Pan: 1600us of range at 60us/step = 27 steps to cross
+   it. Tilt UPWARD: 150us of room at 50us/step = THREE steps. A cap that large relative to
+   the range makes upward correction effectively bang-bang - the camera slams the whole
+   way to its stop and only finds out 180 ms later, which is exactly the "changes vertical
+   position -> oscillates -> loses it" report. 25us gives ~6 steps of up-room instead.
+   This does not slow real tracking: a person standing up shifts the box ~100 px in half a
+   second, which at TILT_GAIN is ~12us/step - the cap never binds. It only tames the
+   transient. */
+#define TILT_DELTA_MAX_US     25.0f  /* was 50.0f - see note above */
 /* Dead-zone half-width, per axis. Must be WIDER than the frame-to-frame noise on that
    axis, otherwise detector jitter alone drives the integrator into a random walk and the
    camera visibly hunts on a stationary target. A person's bounding box is markedly noisier
@@ -195,9 +231,17 @@ typedef struct
 #define VISION_NOMINAL_FRAME_MS 66.0f  /* ~15 fps = the rate today's gains were tuned at, so the
                                           rate scale is 1.0 there and behaviour is unchanged */
 #define RATE_SCALE_MIN          0.35f  /* faster frames -> proportionally smaller steps */
-#define RATE_SCALE_MAX          1.50f  /* but one dropped frame must not become a lurch */
+/* 2026-09-15: pulled 1.50f -> 1.25f. Honest note on a side effect I introduced with the
+   rate scale: below the 15 fps nominal it makes every step BIGGER than the old code did
+   (at 10 fps, 1.5x). That is the theoretically right thing - it holds the commanded
+   velocity constant as the frame rate drops - but it stacked on top of tilt's already
+   high gain, so if the laptop has been running under 15 fps this made tilt worse at the
+   same moment it made pan better. Check the pps= field in the TRACKING_DEBUG line: if it
+   reads well under 15, set VISION_NOMINAL_FRAME_MS to 1000/pps and this ceiling stops
+   mattering. */
+#define RATE_SCALE_MAX          1.25f  /* was 1.50f; a dropped frame must not become a lurch */
 #define PAN_DAMP                0.30f  /* fraction of the in-flight move discounted per step */
-#define TILT_DAMP               0.20f  /* lighter: this axis was never the unstable one */
+#define TILT_DAMP               0.30f  /* was 0.20f; matched to pan - same pipeline, same dead time */
 
 /* ---- Anti-ring watchdog: the backstop that stops the amplitude growing -----
    The damping above should keep the oscillation from starting. This catches the case
@@ -211,7 +255,12 @@ typedef struct
    pass - so real tracking is never mistaken for ringing and never loses its gain. */
 #define RING_HALF_PERIOD_MS   900U   /* crossings farther apart than this are a real target */
 #define RING_PEAK_DECAY_OK    0.70f  /* a healthy overshoot decays; >70% of the last peak rings */
-#define RING_TRIP_COUNT       3U     /* non-decaying fast half-cycles tolerated before backing off */
+/* Per-axis, because the axes cannot afford the same amount of patience. Pan can ring for
+   three half-cycles and still have the target in frame - it has 1600us of range to play
+   with. Tilt has ~150us upward, so three half-cycles is already off the top of the frame;
+   it gets to trip one half-cycle sooner. */
+#define PAN_RING_TRIP         3U     /* non-decaying fast half-cycles tolerated before backing off */
+#define TILT_RING_TRIP        2U     /* less room to spare, so less patience */
 #define RING_GAIN_CUT         0.60f  /* multiply that axis's gain by this on a trip */
 #define RING_GAIN_MIN         0.35f  /* never cut below this - it must still be able to track */
 #define RING_GAIN_RECOVER     0.010f /* handed back per settled sample: ~4 s floor -> 1.0 */
@@ -259,6 +308,16 @@ static float    pan_pulse_us  = (float)PAN_CENTER_US;
 static float    tilt_pulse_us = (float)TILT_CENTER_US;
 static float    filtered_err_x;
 static float    filtered_err_y;
+static const axis_cfg_t pan_cfg =
+{
+  PAN_SIGN, PAN_GAIN, PAN_DAMP, PAN_DEADBAND_PX,
+  PAN_DELTA_MAX_US, PAN_PULSE_MIN_US, PAN_PULSE_MAX_US, PAN_RING_TRIP
+};
+static const axis_cfg_t tilt_cfg =
+{
+  TILT_SIGN, TILT_GAIN, TILT_DAMP, TILT_DEADBAND_PX,
+  TILT_DELTA_MAX_US, TILT_PULSE_MIN_US, TILT_PULSE_MAX_US, TILT_RING_TRIP
+};
 static axis_ctl_t pan_ctl;
 static axis_ctl_t tilt_ctl;
 static uint32_t last_packet_tick;        /* arrival tick of the previously APPLIED sample */
@@ -297,10 +356,9 @@ static float   deadzone_f(float err, float band);
 static float   abs_f(float value);
 static void    axis_ctl_init(axis_ctl_t *axis, uint32_t now);
 static void    axis_ctl_forget(axis_ctl_t *axis, uint32_t now);
-static void    axis_ring_watch(axis_ctl_t *axis, float err, uint32_t now);
-static float   axis_step_us(axis_ctl_t *axis, float filtered_err, float band, float sign,
-                            float gain, float damp, float delta_max, float rate_scale,
-                            uint32_t now);
+static void    axis_ring_watch(axis_ctl_t *axis, float err, uint8_t trip, uint32_t now);
+static float   axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtered_err,
+                          float pulse_us, float rate_scale, uint32_t now);
 static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
@@ -397,7 +455,7 @@ static void axis_ctl_forget(axis_ctl_t *axis, uint32_t now)
    sides quickly (faster than any real target moves) and the new peak is no smaller than
    the last one. Three of those in a row and the axis loses 40% of its gain; the rule
    repeats, so a ring that survives one cut gets cut again until it dies. */
-static void axis_ring_watch(axis_ctl_t *axis, float err, uint32_t now)
+static void axis_ring_watch(axis_ctl_t *axis, float err, uint8_t trip, uint32_t now)
 {
   int8_t sign = (err > 0.0f) ? 1 : ((err < 0.0f) ? -1 : 0);
   float  mag  = abs_f(err);
@@ -435,7 +493,7 @@ static void axis_ring_watch(axis_ctl_t *axis, float err, uint32_t now)
       axis->ring_count--;
     }
 
-    if (axis->ring_count >= RING_TRIP_COUNT)
+    if (axis->ring_count >= trip)
     {
       axis->gain_scale = clamp_f(axis->gain_scale * RING_GAIN_CUT, RING_GAIN_MIN, 1.0f);
       axis->ring_count = 0U;
@@ -456,24 +514,34 @@ static void axis_ring_watch(axis_ctl_t *axis, float err, uint32_t now)
   axis->err_sign = sign;
 }
 
-/* One axis's bounded step, in microseconds, for one fresh measurement:
-       step = sign * gain * gain_scale * rate * deadzone(err)   <- the proportional push
-            - damp * inflight                                    <- minus what is already on its way
-   The second term is the fix for the growing swing: without it the loop keeps
-   re-commanding a correction the camera has already made but the stale frame cannot
-   show yet, and those repeats are the overshoot. */
-static float axis_step_us(axis_ctl_t *axis, float filtered_err, float band, float sign,
-                          float gain, float damp, float delta_max, float rate_scale,
-                          uint32_t now)
+/* One axis's complete update for one fresh measurement. Returns the new pulse:
+       step  = sign * gain * gain_scale * rate * deadzone(err)  <- the proportional push
+             - damp * inflight                                   <- minus what is already on its way
+       pulse = clamp(pulse + clamp(step, +/-delta_max), travel limits)
+   The damping term is the fix for the growing swing: without it the loop keeps
+   re-commanding a correction the camera has already made but the stale frame cannot show
+   yet, and those repeats ARE the overshoot. */
+static float axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtered_err,
+                        float pulse_us, float rate_scale, uint32_t now)
 {
-  float err = deadzone_f(filtered_err, band);
+  float err = deadzone_f(filtered_err, cfg->band_px);
   float step;
+  float next;
 
-  axis_ring_watch(axis, err, now);
+  axis_ring_watch(axis, err, cfg->ring_trip, now);
 
-  step = (sign * gain * axis->gain_scale * rate_scale * err) - (damp * axis->inflight_us);
+  step = (cfg->sign * cfg->gain * axis->gain_scale * rate_scale * err)
+         - (cfg->damp * axis->inflight_us);
+  step = clamp_f(step, -cfg->delta_max_us, cfg->delta_max_us);
 
-  return clamp_f(step, -delta_max, delta_max);
+  next = clamp_f(pulse_us + step, cfg->pulse_min_us, cfg->pulse_max_us);
+
+  /* Book the motion that was ACTUALLY applied - after the per-step cap AND the travel
+     limits - never the motion that was asked for. Against a limit nothing moves, so
+     nothing may accumulate: that is this loop's anti-windup. */
+  axis->inflight_us += (next - pulse_us);
+
+  return next;
 }
 
 /* Atomically take the newest measurement. Returns 1 only if the ISR has produced a
@@ -519,11 +587,6 @@ static void tracking_update(uint32_t now)
   float    dt_ms;
   float    rate_scale;
   float    decay;
-  float    prev_pan;
-  float    prev_tilt;
-  float    next_pan;
-  float    next_tilt;
-  float    step;
 
   fresh = vision_take_sample(&raw_x, &raw_y, &packet_tick);
 
@@ -578,25 +641,10 @@ static void tracking_update(uint32_t now)
   pan_ctl.inflight_us  *= decay;
   tilt_ctl.inflight_us *= decay;
 
-  prev_pan  = pan_pulse_us;
-  prev_tilt = tilt_pulse_us;
-
-  step = axis_step_us(&pan_ctl, filtered_err_x, PAN_DEADBAND_PX, PAN_SIGN, PAN_GAIN,
-                      PAN_DAMP, PAN_DELTA_MAX_US, rate_scale, now);
-  next_pan = pan_pulse_us + step;
-
-  step = axis_step_us(&tilt_ctl, filtered_err_y, TILT_DEADBAND_PX, TILT_SIGN, TILT_GAIN,
-                      TILT_DAMP, TILT_DELTA_MAX_US, rate_scale, now);
-  next_tilt = tilt_pulse_us + step;
-
-  pan_pulse_us  = clamp_f(next_pan,  PAN_PULSE_MIN_US,  PAN_PULSE_MAX_US);
-  tilt_pulse_us = clamp_f(next_tilt, TILT_PULSE_MIN_US, TILT_PULSE_MAX_US);
-
-  /* Book the motion that was ACTUALLY applied - after the per-step cap AND the travel
-     limits - never the motion that was asked for. Against a limit nothing moves, so
-     nothing may accumulate: that is this loop's anti-windup. */
-  pan_ctl.inflight_us  += (pan_pulse_us  - prev_pan);
-  tilt_ctl.inflight_us += (tilt_pulse_us - prev_tilt);
+  pan_pulse_us  = axis_apply(&pan_cfg,  &pan_ctl,  filtered_err_x, pan_pulse_us,
+                             rate_scale, now);
+  tilt_pulse_us = axis_apply(&tilt_cfg, &tilt_ctl, filtered_err_y, tilt_pulse_us,
+                             rate_scale, now);
 
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)pan_pulse_us);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)tilt_pulse_us);
@@ -839,9 +887,13 @@ int main(void)
       /* gp/gt are the watchdog's gain scales in percent: a run of values below 100 is
          the loop telling you it caught itself ringing on that axis. ifp is the pan
          in-flight move in us - the correction already sent that the frame cannot show
-         yet. Both exist so the oscillation can be diagnosed from the log alone. */
+         yet, ift the same for tilt. up= is tilt's remaining UPWARD travel in us: if that
+         sits at 0 while ey stays negative, tilt is not ringing at all, it is pegged
+         against its top stop and physically cannot centre the target - that needs travel
+         (TILT_TRIM_US / the bracket), not tuning. The two look alike on camera and have
+         opposite fixes, so check this field before touching a gain. */
       debug_send_async(snprintf(tx_buffer, sizeof(tx_buffer),
-                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d bad=%lu err=%lu\r\n",
+                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d bad=%lu err=%lu\r\n",
                                 (unsigned long)packets_per_second,
                                 (unsigned long)(now - last_valid_packet_tick),
                                 (int)filtered_err_x, (int)filtered_err_y,
@@ -849,6 +901,8 @@ int main(void)
                                 (unsigned)(pan_ctl.gain_scale * 100.0f),
                                 (unsigned)(tilt_ctl.gain_scale * 100.0f),
                                 (int)pan_ctl.inflight_us,
+                                (int)tilt_ctl.inflight_us,
+                                (int)(tilt_pulse_us - TILT_PULSE_MIN_US),
                                 (unsigned long)bad_checksum_count,
                                 (unsigned long)uart_error_count));
     }
