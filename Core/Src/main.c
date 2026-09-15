@@ -34,6 +34,19 @@ typedef enum
   WAIT_CHECKSUM
 } uart_rx_state_t;
 
+/* Per-axis controller state for the dead-time damping and the anti-ring watchdog.
+   See the notes beside VISION_LATENCY_MS and RING_HALF_PERIOD_MS. */
+typedef struct
+{
+  float    inflight_us;      /* motion already commanded that the vision feed cannot see yet */
+  float    gain_scale;       /* 1.0 normally; cut by the watchdog, handed back slowly */
+  float    peak_err;         /* |error| peak so far in the current half-cycle */
+  float    prev_peak_err;    /* the previous half-cycle's peak, to tell decaying from growing */
+  uint32_t last_cross_tick;  /* when the error last changed sides */
+  uint8_t  ring_count;       /* consecutive fast, non-decaying half-cycles */
+  int8_t   err_sign;         /* which side of centre the error was on last sample */
+} axis_ctl_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -114,7 +127,7 @@ typedef enum
                                         rather than running away), so this sign is correct. Do not flip it. */
 #define TILT_SIGN             1.0f   /* CONFIRMED on hardware: tilt tracks downward correctly. */
 
-/* ---- Incremental proportional controller (no integral, no derivative) ------ */
+/* ---- Incremental controller: proportional push + dead-time damping --------- */
 /* MEASURED 2026-09-14: pan rang (right-left-right-left) around a target it had already
    reached, while tilt at 0.18f/35px was stable. That asymmetry is the whole diagnosis -
    a wrong SIGN runs away and never returns, but ringing around the correct position is a
@@ -124,7 +137,13 @@ typedef enum
    swing is approximately (loop delay in samples) x (fraction of the error cancelled per
    sample); cutting the gain cuts that product directly. 0.12f keeps ~0.3 - comfortably
    damped - while still closing a 200 px error in about a second.
-   If this feels sluggish, raise toward 0.16f. Do NOT go back above 0.18f. */
+   If this feels sluggish, raise toward 0.16f. Do NOT go back above 0.18f.
+   UPDATE 2026-09-15: 0.12f alone was still not enough - the ring came back intermittently
+   and GREW. The gain is left exactly where it is; the fix is the dead-time damping added
+   below, which attacks the cause (corrections issued against a stale error) instead of
+   trading tracking speed away. Because that damping also discounts the large-error
+   approach, this is now the one case where 0.16f is worth trying if acquisition feels
+   slow - but change PAN_DAMP first and only one of the two at a time. */
 #define PAN_GAIN              0.12f  /* was 0.20f - see note above */
 #define TILT_GAIN             0.18f  /* leave alone: this axis is confirmed stable */
 #define PAN_DELTA_MAX_US      60.0f  /* safety cap on one step, so a bad frame cannot lurch */
@@ -139,6 +158,63 @@ typedef enum
 #define TILT_DEADBAND_PX      35.0f
 #define ERR_FILTER_OLD        0.15f  /* light filter only - heavy filtering is pure added lag */
 #define ERR_FILTER_NEW        0.85f
+
+/* ---- Dead-time damping: the cure for the growing left-right swing ----------
+   OBSERVED 2026-09-15: pan usually tracks well, but now and then it starts swinging
+   left-right and the swings GROW until the target leaves the frame. A growing - not
+   merely persistent - amplitude is the signature of a loop whose gain has crossed the
+   stability margin set by its own dead time. It is NOT a wrong sign (that runs away and
+   never comes back) and NOT a too-narrow dead-zone (that hunts at constant, small
+   amplitude). Two things move that margin around at run time, which is exactly why this
+   only bites SOMETIMES rather than always:
+
+     1. FRAME RATE. This is an INCREMENTAL controller: every fresh frame adds gain*error
+        to the pulse, so the motion commanded during one latency window is
+        (frames arriving in that window) x gain x error. If the laptop speeds up from 15
+        to 30 fps, the loop gain DOUBLES although not one constant changed. The rate
+        scale below makes each step proportional to the time it actually covers, so the
+        commanded velocity stops depending on how often frames happen to arrive.
+
+     2. LATENCY. Under load, capture -> inference -> serial stretches, so even more stale
+        corrections pile up before the camera's own motion appears in a frame. The
+        in-flight term below is the direct fix: we know exactly how much we commanded in
+        the last VISION_LATENCY_MS and the camera has already physically made that move,
+        so we subtract it from the next push instead of commanding it a second time. It
+        is a Smith predictor cut down to the one piece that matters here, and PAN_DAMP
+        absorbs the (uncalibrated) pixels-per-microsecond scale, so no camera FOV
+        measurement is needed to tune it.
+
+   This is the "D" the loop was missing, and it is deliberately taken from our COMMANDED
+   motion rather than from the measured error: differentiating a noisy detection that is
+   already 150-200 ms old mostly amplifies jitter, whereas our own command history is
+   exact and has no lag at all.
+   Tuning order: if it still rings, raise PAN_DAMP toward 0.45f. If it now feels
+   sluggish, lower PAN_DAMP toward 0.20f. Either way, change PAN_DAMP before PAN_GAIN -
+   the gain is already at a value confirmed on hardware. */
+#define VISION_LATENCY_MS       180.0f /* capture -> inference -> serial; measured at 150-200 ms */
+#define VISION_NOMINAL_FRAME_MS 66.0f  /* ~15 fps = the rate today's gains were tuned at, so the
+                                          rate scale is 1.0 there and behaviour is unchanged */
+#define RATE_SCALE_MIN          0.35f  /* faster frames -> proportionally smaller steps */
+#define RATE_SCALE_MAX          1.50f  /* but one dropped frame must not become a lurch */
+#define PAN_DAMP                0.30f  /* fraction of the in-flight move discounted per step */
+#define TILT_DAMP               0.20f  /* lighter: this axis was never the unstable one */
+
+/* ---- Anti-ring watchdog: the backstop that stops the amplitude growing -----
+   The damping above should keep the oscillation from starting. This catches the case
+   where it starts anyway (slower laptop, bigger/closer target, a servo fighting more
+   friction than when the gains were set) and guarantees the swings decay instead of
+   building until the target is lost. It looks for the one pattern only a limit cycle
+   produces: the error crossing zero FAST, repeatedly, with peaks that are not shrinking.
+   The half-period gate is what keeps a genuinely moving target safe. A delay-driven ring
+   on this rig swings with a period near 4 x (latency + servo lag), i.e. half-cycles
+   around half a second, while a person pacing across the frame takes several seconds per
+   pass - so real tracking is never mistaken for ringing and never loses its gain. */
+#define RING_HALF_PERIOD_MS   900U   /* crossings farther apart than this are a real target */
+#define RING_PEAK_DECAY_OK    0.70f  /* a healthy overshoot decays; >70% of the last peak rings */
+#define RING_TRIP_COUNT       3U     /* non-decaying fast half-cycles tolerated before backing off */
+#define RING_GAIN_CUT         0.60f  /* multiply that axis's gain by this on a trip */
+#define RING_GAIN_MIN         0.35f  /* never cut below this - it must still be able to track */
+#define RING_GAIN_RECOVER     0.010f /* handed back per settled sample: ~4 s floor -> 1.0 */
 #define CONTROL_PERIOD_MS     20U    /* maximum control rate; a step needs a FRESH sample too */
 #define FAILSAFE_TIMEOUT_MS   250U   /* older than this -> freeze in place (never re-centre) */
 
@@ -183,6 +259,9 @@ static float    pan_pulse_us  = (float)PAN_CENTER_US;
 static float    tilt_pulse_us = (float)TILT_CENTER_US;
 static float    filtered_err_x;
 static float    filtered_err_y;
+static axis_ctl_t pan_ctl;
+static axis_ctl_t tilt_ctl;
+static uint32_t last_packet_tick;        /* arrival tick of the previously APPLIED sample */
 static uint8_t  tracking_ready;          /* 0 until the boot homing sequence has finished */
 static uint8_t  comm_lost;               /* 1 while the vision link is stale */
 
@@ -190,7 +269,7 @@ static uint8_t  comm_lost;               /* 1 while the vision link is stale */
 static uint32_t last_control_tick;
 
 /* ---- Debug / telemetry (never in the control path) ------------------------- */
-static char     tx_buffer[128];
+static char     tx_buffer[160];  /* sized for the widest TRACKING_DEBUG line below */
 #if TRACKING_DEBUG
 static uint32_t last_report_tick;
 static uint32_t pps_window_tick;
@@ -215,6 +294,13 @@ static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 static float   clamp_f(float value, float low, float high);
 static float   deadzone_f(float err, float band);
+static float   abs_f(float value);
+static void    axis_ctl_init(axis_ctl_t *axis, uint32_t now);
+static void    axis_ctl_forget(axis_ctl_t *axis, uint32_t now);
+static void    axis_ring_watch(axis_ctl_t *axis, float err, uint32_t now);
+static float   axis_step_us(axis_ctl_t *axis, float filtered_err, float band, float sign,
+                            float gain, float damp, float delta_max, float rate_scale,
+                            uint32_t now);
 static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
@@ -275,6 +361,121 @@ static float clamp_f(float value, float low, float high)
   return value;
 }
 
+/* Local, so the control path pulls in no libm. */
+static float abs_f(float value)
+{
+  return (value < 0.0f) ? -value : value;
+}
+
+/* Full reset, boot only: the axis starts at full gain with no history. */
+static void axis_ctl_init(axis_ctl_t *axis, uint32_t now)
+{
+  axis->inflight_us     = 0.0f;
+  axis->gain_scale      = 1.0f;
+  axis->peak_err        = 0.0f;
+  axis->prev_peak_err   = 0.0f;
+  axis->last_cross_tick = now;
+  axis->ring_count      = 0U;
+  axis->err_sign        = 0;
+}
+
+/* Drop the history but KEEP the gain the watchdog settled on. Called after a comms
+   dropout: any move commanded before the gap is long since visible, so it must not be
+   subtracted again, and the gap itself is not a half-cycle so it must not be judged as
+   one. The gain is kept deliberately - if the link stuttered mid-oscillation, handing
+   full gain straight back would restart exactly the swing we just damped. */
+static void axis_ctl_forget(axis_ctl_t *axis, uint32_t now)
+{
+  float keep_gain = axis->gain_scale;
+
+  axis_ctl_init(axis, now);
+  axis->gain_scale = keep_gain;
+}
+
+/* Watch one axis for a delay-driven limit cycle and trim its gain if it finds one.
+   Called once per FRESH sample with the dead-zoned error. A ring is: the error changes
+   sides quickly (faster than any real target moves) and the new peak is no smaller than
+   the last one. Three of those in a row and the axis loses 40% of its gain; the rule
+   repeats, so a ring that survives one cut gets cut again until it dies. */
+static void axis_ring_watch(axis_ctl_t *axis, float err, uint32_t now)
+{
+  int8_t sign = (err > 0.0f) ? 1 : ((err < 0.0f) ? -1 : 0);
+  float  mag  = abs_f(err);
+
+  if (sign == 0)
+  {
+    /* Inside the dead-zone: settled, so there is nothing to ring about. Forget the
+       history and start handing the gain back. */
+    axis->peak_err      = 0.0f;
+    axis->prev_peak_err = 0.0f;
+    axis->ring_count    = 0U;
+    axis->err_sign      = 0;
+    axis->gain_scale    = clamp_f(axis->gain_scale + RING_GAIN_RECOVER, RING_GAIN_MIN, 1.0f);
+    return;
+  }
+
+  if (mag > axis->peak_err)
+  {
+    axis->peak_err = mag;
+  }
+
+  if ((axis->err_sign != 0) && (sign != axis->err_sign))
+  {
+    /* The error just crossed centre: one half-cycle is complete, so judge it. */
+    uint8_t fast        = ((now - axis->last_cross_tick) <= RING_HALF_PERIOD_MS) ? 1U : 0U;
+    uint8_t not_decaying = ((axis->prev_peak_err > 0.0f) &&
+                            (axis->peak_err > (RING_PEAK_DECAY_OK * axis->prev_peak_err))) ? 1U : 0U;
+
+    if (fast && not_decaying)
+    {
+      axis->ring_count++;
+    }
+    else if (axis->ring_count > 0U)
+    {
+      axis->ring_count--;
+    }
+
+    if (axis->ring_count >= RING_TRIP_COUNT)
+    {
+      axis->gain_scale = clamp_f(axis->gain_scale * RING_GAIN_CUT, RING_GAIN_MIN, 1.0f);
+      axis->ring_count = 0U;
+    }
+
+    axis->prev_peak_err   = axis->peak_err;
+    axis->peak_err        = 0.0f;
+    axis->last_cross_tick = now;
+  }
+  else
+  {
+    /* Still on the same side of centre: chasing a target, not ringing. Recover, but a
+       quarter as fast as when fully settled, so a cut is not undone mid-pursuit. */
+    axis->gain_scale = clamp_f(axis->gain_scale + (RING_GAIN_RECOVER * 0.25f),
+                               RING_GAIN_MIN, 1.0f);
+  }
+
+  axis->err_sign = sign;
+}
+
+/* One axis's bounded step, in microseconds, for one fresh measurement:
+       step = sign * gain * gain_scale * rate * deadzone(err)   <- the proportional push
+            - damp * inflight                                    <- minus what is already on its way
+   The second term is the fix for the growing swing: without it the loop keeps
+   re-commanding a correction the camera has already made but the stale frame cannot
+   show yet, and those repeats are the overshoot. */
+static float axis_step_us(axis_ctl_t *axis, float filtered_err, float band, float sign,
+                          float gain, float damp, float delta_max, float rate_scale,
+                          uint32_t now)
+{
+  float err = deadzone_f(filtered_err, band);
+  float step;
+
+  axis_ring_watch(axis, err, now);
+
+  step = (sign * gain * axis->gain_scale * rate_scale * err) - (damp * axis->inflight_us);
+
+  return clamp_f(step, -delta_max, delta_max);
+}
+
 /* Atomically take the newest measurement. Returns 1 only if the ISR has produced a
    packet since the previous call. Reading err_x/err_y outside a critical section could
    pair the x of one frame with the y of the next. */
@@ -298,9 +499,16 @@ static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *pack
  *  THE live pan/tilt controller. This is the only code that writes CH1/CH2
  *  once tracking is running, and the only writer of pan_pulse_us/tilt_pulse_us.
  *
- *  Incremental proportional law, one bounded step per FRESH measurement:
- *      pan_pulse_us  += clamp(PAN_SIGN  * PAN_GAIN  * deadzone(filtered_err_x))
- *      tilt_pulse_us += clamp(TILT_SIGN * TILT_GAIN * deadzone(filtered_err_y))
+ *  Incremental law, one bounded step per FRESH measurement, per axis:
+ *      step  = SIGN * GAIN * gain_scale * rate_scale * deadzone(filtered_err)
+ *            - DAMP * inflight_us
+ *      pulse = clamp(pulse + clamp(step, +/-DELTA_MAX), travel limits)
+ *
+ *  rate_scale keeps the commanded velocity independent of the vision frame rate,
+ *  inflight_us stops the loop re-commanding a move the camera has already made but
+ *  the stale frame cannot show yet, and gain_scale is the anti-ring watchdog's
+ *  automatic back-off. Together they are what keeps the swing from growing; see the
+ *  notes at VISION_LATENCY_MS.
  * ------------------------------------------------------------------------- */
 static void tracking_update(uint32_t now)
 {
@@ -308,6 +516,11 @@ static void tracking_update(uint32_t now)
   int16_t  raw_y = 0;
   uint32_t packet_tick = 0U;
   uint8_t  fresh;
+  float    dt_ms;
+  float    rate_scale;
+  float    decay;
+  float    prev_pan;
+  float    prev_tilt;
   float    next_pan;
   float    next_tilt;
   float    step;
@@ -339,10 +552,12 @@ static void tracking_update(uint32_t now)
   if (comm_lost)
   {
     /* First sample after a dropout: seed the filter rather than blending in an
-       arbitrarily old error. */
+       arbitrarily old error, and drop the damping/ring history for the same reason. */
     comm_lost      = 0U;
     filtered_err_x = (float)raw_x;
     filtered_err_y = (float)raw_y;
+    axis_ctl_forget(&pan_ctl,  now);
+    axis_ctl_forget(&tilt_ctl, now);
   }
   else
   {
@@ -350,16 +565,38 @@ static void tracking_update(uint32_t now)
     filtered_err_y = (ERR_FILTER_OLD * filtered_err_y) + (ERR_FILTER_NEW * (float)raw_y);
   }
 
-  step = clamp_f(PAN_SIGN * PAN_GAIN * deadzone_f(filtered_err_x, PAN_DEADBAND_PX),
-                 -PAN_DELTA_MAX_US, PAN_DELTA_MAX_US);
+  /* Time this step actually covers. Measured at the PACKET tick, not at the 20 ms loop
+     tick, so it is the real frame interval even when a frame lands between two loop
+     passes or two frames land inside one. */
+  dt_ms            = (float)(packet_tick - last_packet_tick);
+  last_packet_tick = packet_tick;
+  rate_scale       = clamp_f(dt_ms / VISION_NOMINAL_FRAME_MS, RATE_SCALE_MIN, RATE_SCALE_MAX);
+
+  /* Age out the in-flight move: whatever was commanded VISION_LATENCY_MS ago is in the
+     picture by now, so it must stop being subtracted. */
+  decay = clamp_f(1.0f - (dt_ms / VISION_LATENCY_MS), 0.0f, 1.0f);
+  pan_ctl.inflight_us  *= decay;
+  tilt_ctl.inflight_us *= decay;
+
+  prev_pan  = pan_pulse_us;
+  prev_tilt = tilt_pulse_us;
+
+  step = axis_step_us(&pan_ctl, filtered_err_x, PAN_DEADBAND_PX, PAN_SIGN, PAN_GAIN,
+                      PAN_DAMP, PAN_DELTA_MAX_US, rate_scale, now);
   next_pan = pan_pulse_us + step;
 
-  step = clamp_f(TILT_SIGN * TILT_GAIN * deadzone_f(filtered_err_y, TILT_DEADBAND_PX),
-                 -TILT_DELTA_MAX_US, TILT_DELTA_MAX_US);
+  step = axis_step_us(&tilt_ctl, filtered_err_y, TILT_DEADBAND_PX, TILT_SIGN, TILT_GAIN,
+                      TILT_DAMP, TILT_DELTA_MAX_US, rate_scale, now);
   next_tilt = tilt_pulse_us + step;
 
   pan_pulse_us  = clamp_f(next_pan,  PAN_PULSE_MIN_US,  PAN_PULSE_MAX_US);
   tilt_pulse_us = clamp_f(next_tilt, TILT_PULSE_MIN_US, TILT_PULSE_MAX_US);
+
+  /* Book the motion that was ACTUALLY applied - after the per-step cap AND the travel
+     limits - never the motion that was asked for. Against a limit nothing moves, so
+     nothing may accumulate: that is this loop's anti-windup. */
+  pan_ctl.inflight_us  += (pan_pulse_us  - prev_pan);
+  tilt_ctl.inflight_us += (tilt_pulse_us - prev_tilt);
 
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)pan_pulse_us);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)tilt_pulse_us);
@@ -533,6 +770,9 @@ int main(void)
   /* Arm tracking last, from the calibrated position, with a clean slate. */
   filtered_err_x = 0.0f;
   filtered_err_y = 0.0f;
+  axis_ctl_init(&pan_ctl,  HAL_GetTick());
+  axis_ctl_init(&tilt_ctl, HAL_GetTick());
+  last_packet_tick = HAL_GetTick();
   comm_lost      = 1U;              /* nothing moves until a real packet arrives */
   last_control_tick = HAL_GetTick();
   last_valid_packet_tick = HAL_GetTick() - (FAILSAFE_TIMEOUT_MS + 1U);
@@ -596,12 +836,19 @@ int main(void)
     if ((now - last_report_tick) >= 1000U)
     {
       last_report_tick = now;
+      /* gp/gt are the watchdog's gain scales in percent: a run of values below 100 is
+         the loop telling you it caught itself ringing on that axis. ifp is the pan
+         in-flight move in us - the correction already sent that the frame cannot show
+         yet. Both exist so the oscillation can be diagnosed from the log alone. */
       debug_send_async(snprintf(tx_buffer, sizeof(tx_buffer),
-                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u bad=%lu err=%lu\r\n",
+                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d bad=%lu err=%lu\r\n",
                                 (unsigned long)packets_per_second,
                                 (unsigned long)(now - last_valid_packet_tick),
                                 (int)filtered_err_x, (int)filtered_err_y,
                                 (unsigned)pan_pulse_us, (unsigned)tilt_pulse_us,
+                                (unsigned)(pan_ctl.gain_scale * 100.0f),
+                                (unsigned)(tilt_ctl.gain_scale * 100.0f),
+                                (int)pan_ctl.inflight_us,
                                 (unsigned long)bad_checksum_count,
                                 (unsigned long)uart_error_count));
     }
