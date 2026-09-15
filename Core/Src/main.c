@@ -86,15 +86,21 @@ typedef enum
    Required end behaviour:
        target right (err_x>0) -> camera pans right
        target below (err_y>0) -> camera tilts down                            */
-#define PAN_SIGN              1.0f   /* +1 assumes increasing pulse pans RIGHT */
-#define TILT_SIGN             1.0f   /* +1 assumes increasing pulse tilts DOWN (see TILT_BOTTOM_US) */
+#define PAN_SIGN             -1.0f   /* MEASURED 2026-09-14: increasing pulse pans LEFT, so err_x>0 must DECREASE the pulse */
+#define TILT_SIGN             1.0f   /* MEASURED 2026-09-14: correct as-is, tilt follows the target */
 
 /* ---- Incremental proportional controller (no integral, no derivative) ------ */
 #define PAN_GAIN              0.20f  /* us of pulse per pixel of error, per accepted sample */
 #define TILT_GAIN             0.18f
 #define PAN_DELTA_MAX_US      60.0f  /* safety cap on one step, so a bad frame cannot lurch */
 #define TILT_DELTA_MAX_US     50.0f
-#define DEADBAND_PX           20.0f  /* inside this the servo holds still */
+/* Dead-zone half-width, per axis. Must be WIDER than the frame-to-frame noise on that
+   axis, otherwise detector jitter alone drives the integrator into a random walk and the
+   camera visibly hunts on a stationary target. A person's bounding box is markedly noisier
+   vertically than horizontally (posture, limbs, box height), so tilt needs a wider band.
+   Tune from the TRACKING_DEBUG ex=/ey= fields: pick a little above the resting spread. */
+#define PAN_DEADBAND_PX       20.0f
+#define TILT_DEADBAND_PX      35.0f
 #define ERR_FILTER_OLD        0.15f  /* light filter only - heavy filtering is pure added lag */
 #define ERR_FILTER_NEW        0.85f
 #define CONTROL_PERIOD_MS     20U    /* maximum control rate; a step needs a FRESH sample too */
@@ -172,6 +178,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 static float   clamp_f(float value, float low, float high);
+static float   deadzone_f(float err, float band);
 static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
@@ -199,6 +206,25 @@ static void debug_send_async(int length)
   }
 }
 #endif
+
+/* Error with the dead-zone SUBTRACTED, not merely gated. A hard gate is discontinuous:
+   one pixel outside the band the servo jumps straight to a full gain*err kick, one pixel
+   inside it holds. That discontinuity is what converts detector noise into a limit cycle.
+   Subtracting instead makes the correction start at zero at the edge and grow smoothly,
+   which is also exactly the desired feel: far -> keeps moving, near -> eases off, centred
+   -> stops. */
+static float deadzone_f(float err, float band)
+{
+  if (err > band)
+  {
+    return err - band;
+  }
+  if (err < -band)
+  {
+    return err + band;
+  }
+  return 0.0f;
+}
 
 static float clamp_f(float value, float low, float high)
 {
@@ -237,8 +263,8 @@ static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *pack
  *  once tracking is running, and the only writer of pan_pulse_us/tilt_pulse_us.
  *
  *  Incremental proportional law, one bounded step per FRESH measurement:
- *      pan_pulse_us  += clamp(PAN_SIGN  * PAN_GAIN  * filtered_err_x)
- *      tilt_pulse_us += clamp(TILT_SIGN * TILT_GAIN * filtered_err_y)
+ *      pan_pulse_us  += clamp(PAN_SIGN  * PAN_GAIN  * deadzone(filtered_err_x))
+ *      tilt_pulse_us += clamp(TILT_SIGN * TILT_GAIN * deadzone(filtered_err_y))
  * ------------------------------------------------------------------------- */
 static void tracking_update(uint32_t now)
 {
@@ -288,22 +314,13 @@ static void tracking_update(uint32_t now)
     filtered_err_y = (ERR_FILTER_OLD * filtered_err_y) + (ERR_FILTER_NEW * (float)raw_y);
   }
 
-  next_pan  = pan_pulse_us;
-  next_tilt = tilt_pulse_us;
+  step = clamp_f(PAN_SIGN * PAN_GAIN * deadzone_f(filtered_err_x, PAN_DEADBAND_PX),
+                 -PAN_DELTA_MAX_US, PAN_DELTA_MAX_US);
+  next_pan = pan_pulse_us + step;
 
-  if ((filtered_err_x > DEADBAND_PX) || (filtered_err_x < -DEADBAND_PX))
-  {
-    step = clamp_f(PAN_SIGN * PAN_GAIN * filtered_err_x,
-                   -PAN_DELTA_MAX_US, PAN_DELTA_MAX_US);
-    next_pan += step;
-  }
-
-  if ((filtered_err_y > DEADBAND_PX) || (filtered_err_y < -DEADBAND_PX))
-  {
-    step = clamp_f(TILT_SIGN * TILT_GAIN * filtered_err_y,
-                   -TILT_DELTA_MAX_US, TILT_DELTA_MAX_US);
-    next_tilt += step;
-  }
+  step = clamp_f(TILT_SIGN * TILT_GAIN * deadzone_f(filtered_err_y, TILT_DEADBAND_PX),
+                 -TILT_DELTA_MAX_US, TILT_DELTA_MAX_US);
+  next_tilt = tilt_pulse_us + step;
 
   pan_pulse_us  = clamp_f(next_pan,  PAN_PULSE_MIN_US,  PAN_PULSE_MAX_US);
   tilt_pulse_us = clamp_f(next_tilt, TILT_PULSE_MIN_US, TILT_PULSE_MAX_US);
