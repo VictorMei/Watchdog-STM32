@@ -274,18 +274,22 @@ typedef struct
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
 #define TRACKING_DEBUG        1      /* 1 = one compact non-blocking status line per second - ON to diagnose "nothing moves" */
 
-/* ---- Temporary L9110S drive-motor hardware test ---------------------------
-   1 = run a one-shot GPIO-only motor exercise at boot, then halt forever.
-   Set back to 0 to return to normal pan/tilt tracking - this must never be
-   left on for real operation, and none of its HAL_Delay() calls compile in
-   when it is off. */
+/* ---- Temporary drivetrain bring-up test mode -------------------------------
+   1 = run a one-shot forward/backward/left/right exercise at boot (through
+   the real motors_*() helpers below), then halt forever. Set back to 0 to
+   return to normal pan/tilt tracking - this must never be left on for real
+   operation, and none of its HAL_Delay() calls compile in when it is off.
+   The motors_*() drivetrain API itself is NOT gated by this flag: it is the
+   permanent abstraction vision will drive later. */
 #define MOTOR_HARDWARE_TEST   0
 
 /* L9110S channel A ("A-1A"/"A-1B") drives one wheel, channel B ("B-1A"/"B-2A")
    drives the other. Wiring per the current harness:
      A-1A = PB10 (D6)   A-1B = PB5 (D4)
      B-1A = PA9  (D8)   B-2A = PA8  (D7)
-   Both pins already come up as GPIO_MODE_OUTPUT_PP from MX_GPIO_Init(). */
+   Both pins already come up as GPIO_MODE_OUTPUT_PP from MX_GPIO_Init(). Both
+   channels are individually confirmed working: driving a channel's pin_1
+   HIGH / pin_2 LOW spins that channel's motor in its "forward" direction. */
 #define MOTOR_A_PORT_1        GPIOB
 #define MOTOR_A_PIN_1         GPIO_PIN_10   /* A-1A */
 #define MOTOR_A_PORT_2        GPIOB
@@ -295,10 +299,40 @@ typedef struct
 #define MOTOR_B_PORT_2        GPIOA
 #define MOTOR_B_PIN_2         GPIO_PIN_8    /* B-2A */
 
-/* Flip either of these independently if that motor spins the wrong way for
-   the chassis - no need to touch motors_forward()/backward()/turn logic. */
-#define MOTOR_A_REVERSED      0
-#define MOTOR_B_REVERSED      0
+/* -------- Physical chassis mapping: everything wiring-specific lives here --
+   Two separate physical facts, fixed here and nowhere else, so
+   motors_forward()/backward()/turn_left()/turn_right() never need to know
+   about channel labels or chassis orientation:
+     1) which electrical channel (A or B) is mounted on which side, and
+     2) whether that side's "electrical forward" is actually backward once
+        mounted (a wheel remounted facing the other way spins the "wrong"
+        way for the same IN1/IN2 pattern).
+   Run the MOTOR_HARDWARE_TEST sequence below and watch the car: if it drives
+   backward when motors_forward() runs, or spins in place instead of driving
+   straight, fix the flags here - never the helper functions. */
+#define LEFT_MOTOR_IS_MOTOR_A 1      /* 0 if Motor B is physically the left wheel */
+#define MOTOR_LEFT_REVERSED   0      /* 1 if the left wheel spins backward when driven forward */
+#define MOTOR_RIGHT_REVERSED  0      /* 1 if the right wheel spins backward when driven forward */
+
+#if LEFT_MOTOR_IS_MOTOR_A
+#define MOTOR_LEFT_PORT_1     MOTOR_A_PORT_1
+#define MOTOR_LEFT_PIN_1      MOTOR_A_PIN_1
+#define MOTOR_LEFT_PORT_2     MOTOR_A_PORT_2
+#define MOTOR_LEFT_PIN_2      MOTOR_A_PIN_2
+#define MOTOR_RIGHT_PORT_1    MOTOR_B_PORT_1
+#define MOTOR_RIGHT_PIN_1     MOTOR_B_PIN_1
+#define MOTOR_RIGHT_PORT_2    MOTOR_B_PORT_2
+#define MOTOR_RIGHT_PIN_2     MOTOR_B_PIN_2
+#else
+#define MOTOR_LEFT_PORT_1     MOTOR_B_PORT_1
+#define MOTOR_LEFT_PIN_1      MOTOR_B_PIN_1
+#define MOTOR_LEFT_PORT_2     MOTOR_B_PORT_2
+#define MOTOR_LEFT_PIN_2      MOTOR_B_PIN_2
+#define MOTOR_RIGHT_PORT_1    MOTOR_A_PORT_1
+#define MOTOR_RIGHT_PIN_1     MOTOR_A_PIN_1
+#define MOTOR_RIGHT_PORT_2    MOTOR_A_PORT_2
+#define MOTOR_RIGHT_PIN_2     MOTOR_A_PIN_2
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -386,12 +420,12 @@ static float   axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtere
 static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
-#if MOTOR_HARDWARE_TEST
 static void    motors_stop(void);
 static void    motors_forward(void);
 static void    motors_backward(void);
 static void    motors_turn_left(void);
 static void    motors_turn_right(void);
+#if MOTOR_HARDWARE_TEST
 static void    motor_hardware_test_run(void);
 #endif
 /* USER CODE END PFP */
@@ -699,8 +733,9 @@ static void uart_rx_keepalive(void)
   __set_PRIMASK(primask);
 }
 
-#if MOTOR_HARDWARE_TEST
-/* Simple two-wire L9110S channel: HIGH/LOW only, no PWM. One motor per channel. */
+/* Simple two-wire L9110S channel: HIGH/LOW only, no PWM. One motor per channel.
+   This is the permanent drivetrain abstraction - vision will call the
+   motors_*() functions below directly once connected. */
 typedef enum
 {
   MOTOR_DIR_STOP = 0,
@@ -734,87 +769,72 @@ static void motor_drive(GPIO_TypeDef *port1, uint16_t pin1,
   }
 }
 
-/* Motor A = left side, Motor B = right side (swap the turn functions below if
-   that assumption is backwards for this chassis). */
+/* These only ever reference the MOTOR_LEFT_.. / MOTOR_RIGHT_.. mapping -
+   channel labels and chassis orientation are fully hidden behind the
+   mapping in USER CODE BEGIN PD, so higher-level (and future vision) code
+   never needs to know which electrical channel is which wheel or which way
+   it is mounted. */
 static void motors_stop(void)
 {
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_STOP, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_STOP, MOTOR_B_REVERSED);
+  motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
+             MOTOR_DIR_STOP, MOTOR_LEFT_REVERSED);
+  motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
+             MOTOR_DIR_STOP, MOTOR_RIGHT_REVERSED);
 }
 
 static void motors_forward(void)
 {
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_B_REVERSED);
+  motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_LEFT_REVERSED);
+  motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_RIGHT_REVERSED);
 }
 
 static void motors_backward(void)
 {
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_B_REVERSED);
+  motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_LEFT_REVERSED);
+  motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_RIGHT_REVERSED);
 }
 
+/* Pivot left: left wheel backward, right wheel forward. */
 static void motors_turn_left(void)
 {
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_B_REVERSED);
+  motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_LEFT_REVERSED);
+  motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_RIGHT_REVERSED);
 }
 
+/* Pivot right: left wheel forward, right wheel backward. */
 static void motors_turn_right(void)
 {
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_B_REVERSED);
+  motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
+             MOTOR_DIR_FWD, MOTOR_LEFT_REVERSED);
+  motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
+             MOTOR_DIR_BWD, MOTOR_RIGHT_REVERSED);
 }
 
-/* One-shot channel-isolation test: drives Motor A alone, then Motor B alone,
-   then both together, so a "only one wheel turns" symptom can be attributed
-   to one L9110S channel/motor instead of the shared code path. HAL_Delay() is
-   only ever used here - never in the tracking loop - and this function halts
-   forever afterward, so it cannot run alongside normal pan/tilt/vision
-   operation. */
+#if MOTOR_HARDWARE_TEST
+/* One-shot drivetrain bring-up test: exercises the motors_*() helpers
+   themselves (not raw channels) so the FUNCTION NAMES can be checked against
+   the car's actual physical behavior. HAL_Delay() is only ever used here -
+   never in the tracking loop - and this function halts forever afterward, so
+   it cannot run alongside normal pan/tilt/vision operation. */
 static void motor_hardware_test_run(void)
 {
-  /* Phase 1: Motor A only, forward.
-       A-1A (PB10) = HIGH, A-1B (PB5) = LOW   -> Motor A forward
-       B-1A (PA9)  = LOW,  B-2A (PA8) = LOW   -> Motor B held stopped */
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_STOP, MOTOR_B_REVERSED);
-  HAL_Delay(2000);
+  motors_forward();     HAL_Delay(1000);
+  motors_stop();        HAL_Delay(1000);
 
-  motors_stop();         /* all four pins LOW */
-  HAL_Delay(1000);
+  motors_backward();    HAL_Delay(1000);
+  motors_stop();        HAL_Delay(1000);
 
-  /* Phase 2: Motor B only, forward.
-       A-1A (PB10) = LOW,  A-1B (PB5) = LOW   -> Motor A held stopped
-       B-1A (PA9)  = HIGH, B-2A (PA8) = LOW   -> Motor B forward */
-  motor_drive(MOTOR_A_PORT_1, MOTOR_A_PIN_1, MOTOR_A_PORT_2, MOTOR_A_PIN_2,
-             MOTOR_DIR_STOP, MOTOR_A_REVERSED);
-  motor_drive(MOTOR_B_PORT_1, MOTOR_B_PIN_1, MOTOR_B_PORT_2, MOTOR_B_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_B_REVERSED);
-  HAL_Delay(2000);
+  motors_turn_left();   HAL_Delay(1000);
+  motors_stop();        HAL_Delay(1000);
 
-  motors_stop();         /* all four pins LOW */
-  HAL_Delay(1000);
-
-  /* Phase 3: both motors, forward.
-       A-1A (PB10) = HIGH, A-1B (PB5) = LOW   -> Motor A forward
-       B-1A (PA9)  = HIGH, B-2A (PA8) = LOW   -> Motor B forward */
-  motors_forward();
-  HAL_Delay(2000);
-
-  motors_stop();         /* all four pins LOW, permanently */
+  motors_turn_right();  HAL_Delay(1000);
+  motors_stop();
 
   while (1)
   {
