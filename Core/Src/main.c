@@ -343,9 +343,9 @@ typedef struct
    the only side that actually knows whether a frame contained a detection -
    the STM32 is told the two resulting booleans and nothing more. Never infer
    "detected" from servo position or image error here.
-   PB3 is a JTAG pin out of reset, but the CubeMX-generated HAL_MspInit()
-   already runs __HAL_AFIO_REMAP_SWJ_DISABLE() (project Debug = No Debug), so
-   it is an ordinary GPIO by the time MX_GPIO_Init() runs. */
+   PB3 is JTDO out of reset. HAL_MspInit() does run __HAL_AFIO_REMAP_SWJ_DISABLE()
+   (project Debug = No Debug), but that is NOT still in force by the time this pin
+   is configured - see the SWJ note in MX_GPIO_Init(), which is why green never lit. */
 #define LED_BLUE_PORT         GPIOA
 #define LED_BLUE_PIN          GPIO_PIN_10   /* D2 */
 #define LED_GREEN_PORT        GPIOB
@@ -378,6 +378,7 @@ static uint8_t          uart_rx_payload[5];   /* 4 legacy bytes + optional statu
 volatile int16_t  target_err_x;
 volatile int16_t  target_err_y;
 volatile uint8_t  new_target_data;
+volatile uint8_t  target_detected;         /* did the frame behind target_err_* actually contain a target? */
 volatile uint8_t  vision_status_flags;     /* VISION_STATUS_* bits from the last 5-byte packet */
 volatile uint32_t last_status_tick;        /* when that status last arrived - drives the LED timeout */
 volatile uint32_t last_valid_packet_tick;
@@ -410,7 +411,7 @@ static uint8_t  comm_lost;               /* 1 while the vision link is stale */
 static uint32_t last_control_tick;
 
 /* ---- Debug / telemetry (never in the control path) ------------------------- */
-static char     tx_buffer[160];  /* sized for the widest TRACKING_DEBUG line below */
+static char     tx_buffer[192];  /* sized for the widest TRACKING_DEBUG line below */
 #if TRACKING_DEBUG
 static uint32_t last_report_tick;
 static uint32_t pps_window_tick;
@@ -433,7 +434,8 @@ static void    axis_ctl_forget(axis_ctl_t *axis, uint32_t now);
 static void    axis_ring_watch(axis_ctl_t *axis, float err, uint8_t trip, uint32_t now);
 static float   axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtered_err,
                           float pulse_us, float rate_scale, uint32_t now);
-static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
+static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick,
+                                  uint8_t *detected);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
 static void    status_leds_update(uint32_t now);
@@ -613,6 +615,22 @@ static float axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtered_
 
   axis_ring_watch(axis, err, cfg->ring_trip, now);
 
+  if (err == 0.0f)
+  {
+    /* Centred. THE STATIONARY-TARGET WIGGLE LIVED HERE: with err == 0 the step was
+       -damp * inflight, a pure back-drive. Arriving on target leaves inflight at
+       roughly gain*err/(1 - decay*(1 - damp)) us, and that term then walked the servo
+       BACKWARDS by ~a third of it, which pushed the error straight back outside the
+       dead-zone, which commanded a fresh push, which refilled inflight - a self-
+       sustaining left-right hunt on a target that was not moving at all.
+       The in-flight term exists to stop the loop re-commanding a move the camera has
+       already made but the stale frame cannot show yet. It is a DISCOUNT on a
+       correction, never a correction of its own, so with nothing to correct there is
+       nothing to discount. inflight still ages out normally in tracking_update(), so
+       the discount is intact for the next real error. */
+    return pulse_us;
+  }
+
   step = (cfg->sign * cfg->gain * axis->gain_scale * rate_scale * err)
          - (cfg->damp * axis->inflight_us);
   step = clamp_f(step, -cfg->delta_max_us, cfg->delta_max_us);
@@ -629,8 +647,10 @@ static float axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtered_
 
 /* Atomically take the newest measurement. Returns 1 only if the ISR has produced a
    packet since the previous call. Reading err_x/err_y outside a critical section could
-   pair the x of one frame with the y of the next. */
-static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick)
+   pair the x of one frame with the y of the next - and the same applies to the
+   detection flag, which is why it is taken here and not read from the LED state. */
+static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick,
+                                  uint8_t *detected)
 {
   uint32_t primask = __get_PRIMASK();
   uint8_t  fresh;
@@ -640,6 +660,7 @@ static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *pack
   *err_x       = target_err_x;
   *err_y       = target_err_y;
   *packet_tick = last_valid_packet_tick;
+  *detected    = target_detected;
   new_target_data = 0U;
   __set_PRIMASK(primask);
 
@@ -667,11 +688,12 @@ static void tracking_update(uint32_t now)
   int16_t  raw_y = 0;
   uint32_t packet_tick = 0U;
   uint8_t  fresh;
+  uint8_t  detected = 0U;
   float    dt_ms;
   float    rate_scale;
   float    decay;
 
-  fresh = vision_take_sample(&raw_x, &raw_y, &packet_tick);
+  fresh = vision_take_sample(&raw_x, &raw_y, &packet_tick, &detected);
 
   if (!tracking_ready)
   {
@@ -692,6 +714,20 @@ static void tracking_update(uint32_t now)
      overshoot and chase past the target. So: no fresh sample, no movement. */
   if (!fresh)
   {
+    return;
+  }
+
+  /* A packet arrived but the frame behind it held no target. The link is healthy, so
+     the failsafe above does not fire - and until now nothing else stopped the loop
+     either: it steered on whatever err_x/err_y the vision side put in a not-detected
+     frame (zeros, or the last known position, or a one-frame false positive). That is
+     the other half of "wanders off and loses the target". Freeze instead, exactly as
+     for a dead link, and re-seed on re-acquisition so the first real frame after the
+     gap is not blended with a stale error or charged for in-flight motion the camera
+     finished long ago. */
+  if (!detected)
+  {
+    comm_lost = 1U;
     return;
   }
 
@@ -1035,6 +1071,7 @@ int main(void)
   last_control_tick = HAL_GetTick();
   last_valid_packet_tick = HAL_GetTick() - (FAILSAFE_TIMEOUT_MS + 1U);
   vision_status_flags    = 0U;
+  target_detected        = 0U;
   last_status_tick       = HAL_GetTick() - (FAILSAFE_TIMEOUT_MS + 1U);
   new_target_data = 0U;
   uart_rx_state   = WAIT_AA;
@@ -1079,11 +1116,19 @@ int main(void)
          sits at 0 while ey stays negative, tilt is not ringing at all, it is pegged
          against its top stop and physically cannot centre the target - that needs travel
          (TILT_TRIM_US / the bracket), not tuning. The two look alike on camera and have
-         opposite fixes, so check this field before touching a gain. */
+         opposite fixes, so check this field before touching a gain.
+         flg= is the raw 5th payload byte and sage= is how long ago one last arrived.
+         Read them together before blaming the LEDs: sage climbing past 250 means the
+         vision side is still sending 4-byte packets and the firmware is correctly
+         holding both LEDs dark, flg=0x01 means detected-but-never-locked (the lock
+         rule on the Python side never fires), and flg=0x03 with no green LED is the
+         only combination that points back at this firmware. */
       debug_send_async(snprintf(tx_buffer, sizeof(tx_buffer),
-                                "T pps=%lu age=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d bad=%lu err=%lu\r\n",
+                                "T pps=%lu age=%lu flg=0x%02X sage=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d bad=%lu err=%lu\r\n",
                                 (unsigned long)packets_per_second,
                                 (unsigned long)(now - last_valid_packet_tick),
+                                (unsigned)vision_status_flags,
+                                (unsigned long)(now - last_status_tick),
                                 (int)filtered_err_x, (int)filtered_err_y,
                                 (unsigned)pan_pulse_us, (unsigned)tilt_pulse_us,
                                 (unsigned)(pan_ctl.gain_scale * 100.0f),
@@ -1273,6 +1318,19 @@ static void MX_GPIO_Init(void)
   __HAL_AFIO_REMAP_I2C1_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* GREEN-LED BUG, fixed here: PB3 is JTDO, and it is only usable as a GPIO while
+     SWJ_CFG = 0b100 (JTAG-DP and SW-DP both disabled). HAL_MspInit() sets exactly
+     that via __HAL_AFIO_REMAP_SWJ_DISABLE()... and then __HAL_AFIO_REMAP_I2C1_ENABLE()
+     a few lines above UNDOES it. That macro expands to AFIO_REMAP_ENABLE(), whose
+     read-modify-write does "tmpreg |= AFIO_MAPR_SWJ_CFG" - it ORs in the whole
+     three-bit field, turning 0b100 into 0b111, which is a reserved value and is not
+     "SWJ disabled". PB3 therefore stayed owned by the debug port and the green LED
+     could never be driven, while blue on PA10 (not a JTAG pin) worked fine.
+     Re-assert the disable AFTER every AFIO_REMAP_ENABLE() user and BEFORE configuring
+     PB3. Any macro named __HAL_AFIO_REMAP_*_ENABLE() added above this line has the
+     same side effect, so this must stay last. */
+  __HAL_AFIO_REMAP_SWJ_DISABLE();
+
   /* Status LEDs: D2 = PA10 (blue), D3 = PB3 (green). Both GPIO clocks are
      already enabled above, and both LEDs start OFF. */
   HAL_GPIO_WritePin(LED_BLUE_PORT,  LED_BLUE_PIN,  GPIO_PIN_RESET);
@@ -1364,6 +1422,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                via the timeout rather than latching a stale state. */
             vision_status_flags = uart_rx_payload[4];
             last_status_tick    = last_valid_packet_tick;
+            /* Latched WITH the errors it belongs to, so the controller can never pair
+               one frame's "detected" with another frame's pixels. */
+            target_detected = ((uart_rx_payload[4] & VISION_STATUS_DETECTED) != 0U) ? 1U : 0U;
+          }
+          else
+          {
+            /* Legacy 4-byte frame carries no detection flag. A vision program using
+               that protocol only ever sent a packet when it HAD a target, so treating
+               it as detected preserves the old behaviour exactly. */
+            target_detected = 1U;
           }
           HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* LD2 flickers = vision link alive */
         }
