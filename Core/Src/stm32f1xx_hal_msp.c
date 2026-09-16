@@ -225,4 +225,34 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
 
 /* USER CODE BEGIN 1 */
 
+/**
+  * @brief I2C MSP Initialization
+  * This function configures the hardware resources used in this example
+  * @param hi2c: I2C handle pointer
+  * @retval None
+  */
+void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
+{
+  if (hi2c->Instance == I2C1)
+  {
+    /* PB8 (SCL) / PB9 (SDA) alternate-function config and the I2C1 remap
+       (__HAL_AFIO_REMAP_I2C1_ENABLE()) already live in MX_GPIO_Init() for
+       this project, so they are not repeated here. */
+    __HAL_RCC_I2C1_CLK_ENABLE();
+  }
+}
+
+/**
+  * @brief I2C MSP De-Initialization
+  * @param hi2c: I2C handle pointer
+  * @retval None
+  */
+void HAL_I2C_MspDeInit(I2C_HandleTypeDef* hi2c)
+{
+  if (hi2c->Instance == I2C1)
+  {
+    __HAL_RCC_I2C1_CLK_DISABLE();
+  }
+}
+
 /* USER CODE END 1 */

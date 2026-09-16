@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
+#include "lcd_i2c.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +34,15 @@ typedef enum
   WAIT_55,
   WAIT_LEN,
   WAIT_PAYLOAD,
-  WAIT_CHECKSUM
+  WAIT_CHECKSUM,
+  /* Target-name message: a second, distinct framing (header 0xA5 0x5A,
+     never 0xAA 0x55) sharing this same byte-at-a-time parser/ISR so the
+     two message types can never race on rx_byte. Low rate only - sent on
+     target change / reconnect, never per tracking frame. */
+  WAIT_NAME_A5,
+  WAIT_NAME_LEN,
+  WAIT_NAME_PAYLOAD,
+  WAIT_NAME_CHECKSUM
 } uart_rx_state_t;
 
 /* Per-axis controller state for the dead-time damping and the anti-ring watchdog.
@@ -354,6 +364,25 @@ typedef struct
 /* Bits of the optional 5th vision payload byte. */
 #define VISION_STATUS_DETECTED 0x01U
 #define VISION_STATUS_LOCKED   0x02U
+
+/* ---- 16x2 status LCD (PCF8574 I2C backpack, HD44780) -----------------------
+   I2C1 is remapped onto PB8 (SCL) / PB9 (SDA) - see MX_GPIO_Init(). This
+   reuses the I2C1 bus originally wired for the (currently deferred) MPU6050;
+   nothing else is on the bus while tracking runs. */
+#define LCD_I2C_CLOCK_HZ        100000U   /* conservative standard-mode speed */
+
+/* ---- Target-name message (separate, low-rate, over the same USART2 link) --
+   Distinct framing from the high-rate tracking packet (0xAA 0x55 LEN payload
+   checksum): header is 0xA5 0x5A, which cannot appear as a valid tracking
+   header and vice versa, so the two can never be mistaken for each other.
+     0xA5 0x5A LEN(1..16) name[LEN bytes, ASCII] checksum
+   checksum = XOR of LEN and every payload byte, same convention as the
+   tracking packet. LEN is capped at the LCD's column count so the name can
+   never overflow either the RX payload buffer or the display. */
+#define TARGET_NAME_HDR1        0xA5U
+#define TARGET_NAME_HDR2        0x5AU
+#define TARGET_NAME_MAX_LEN     LCD_I2C_COLS   /* 16 - matches the LCD width */
+#define TARGET_NAME_FALLBACK    "TARGET"       /* shown until a name arrives */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -366,6 +395,8 @@ TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart2;
 
+I2C_HandleTypeDef hi2c1;
+
 /* USER CODE BEGIN PV */
 /* ---- Vision link, written by the USART2 RX ISR ----------------------------- */
 static uint8_t          rx_byte;
@@ -374,6 +405,16 @@ static uint8_t          uart_rx_length;
 static uint8_t          uart_rx_index;
 static uint8_t          uart_rx_checksum;
 static uint8_t          uart_rx_payload[5];   /* 4 legacy bytes + optional status byte */
+
+/* ---- Target-name message parsing, ISR-side. Shares the RX byte stream and
+   ISR with the tracking parser above but keeps fully separate state, since
+   the two framings can arrive interleaved on the wire. ---------------------- */
+static uint8_t           uart_name_length;
+static uint8_t           uart_name_index;
+static uint8_t           uart_name_checksum;
+static uint8_t           uart_name_payload[TARGET_NAME_MAX_LEN];
+static volatile char     target_name_buffer[TARGET_NAME_MAX_LEN + 1] = TARGET_NAME_FALLBACK;
+static volatile uint32_t bad_name_checksum_count;
 
 volatile int16_t  target_err_x;
 volatile int16_t  target_err_y;
@@ -407,6 +448,19 @@ static uint32_t last_packet_tick;        /* arrival tick of the previously APPLI
 static uint8_t  tracking_ready;          /* 0 until the boot homing sequence has finished */
 static uint8_t  comm_lost;               /* 1 while the vision link is stale */
 
+/* ---- Status LCD: what is currently ON SCREEN, so lcd_status_update() only
+   ever touches the I2C bus when that would actually change. ------------------ */
+typedef enum
+{
+  LCD_SHOW_SEARCHING = 0,
+  LCD_SHOW_ACQUIRING,
+  LCD_SHOW_LOCKED
+} lcd_shown_state_t;
+
+static uint8_t           lcd_shown_valid;   /* 0 until the first draw, so it always happens once */
+static lcd_shown_state_t lcd_shown_state;
+static char               lcd_shown_name[TARGET_NAME_MAX_LEN + 1];
+
 /* ---- Loop scheduling ------------------------------------------------------- */
 static uint32_t last_control_tick;
 
@@ -425,6 +479,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 static float   clamp_f(float value, float low, float high);
 static float   deadzone_f(float err, float band);
@@ -439,6 +494,8 @@ static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *pack
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
 static void    status_leds_update(uint32_t now);
+static void    target_name_take(char *out, size_t out_size);
+static void    lcd_status_update(uint32_t now);
 static void    motors_stop(void);
 static void    motors_forward(void);
 static void    motors_backward(void);
@@ -809,6 +866,102 @@ static void status_leds_update(uint32_t now)
                     (green != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
+/* Atomically snapshot the most recently received target name. Mirrors
+   vision_take_sample()'s critical-section pattern: the ISR writes the whole
+   null-terminated string in one pass (see WAIT_NAME_CHECKSUM below), but the
+   main loop must not read it mid-write if a fresh name packet lands between
+   two of its characters. out_size must be sizeof(lcd_shown_name)-class
+   (TARGET_NAME_MAX_LEN + 1); the copy is always null-terminated and never
+   reads or writes past out_size. */
+static void target_name_take(char *out, size_t out_size)
+{
+  uint32_t primask = __get_PRIMASK();
+  size_t   i;
+
+  __disable_irq();
+  for (i = 0U; (i < (out_size - 1U)) && (target_name_buffer[i] != '\0'); i++)
+  {
+    out[i] = target_name_buffer[i];
+  }
+  __set_PRIMASK(primask);
+
+  out[i] = '\0';
+}
+
+/* Decide what the LCD should show from the SAME gated detected/locked
+   booleans status_leds_update() computes for the LEDs (vision_status_flags,
+   last_status_tick, FAILSAFE_TIMEOUT_MS), so the LCD state and the LEDs can
+   never disagree or drift apart - including on a vision timeout, where both
+   fall back to "no target" together.
+   Only touches the I2C bus when the state actually decided to show, or the
+   locked target's name, has changed since the last call - never every loop
+   pass. Safe to call unconditionally: a no-op if no LCD was detected at
+   boot. */
+static void lcd_status_update(uint32_t now)
+{
+  uint8_t           flags    = vision_status_flags;
+  uint8_t           detected = 0U;
+  uint8_t           locked   = 0U;
+  lcd_shown_state_t new_state;
+  char              name[TARGET_NAME_MAX_LEN + 1];
+  char              line1[LCD_I2C_COLS + 1];
+  size_t            i;
+
+  if (!lcd_i2c_is_present())
+  {
+    return;
+  }
+
+  if ((now - last_status_tick) <= FAILSAFE_TIMEOUT_MS)
+  {
+    detected = ((flags & VISION_STATUS_DETECTED) != 0U) ? 1U : 0U;
+    locked   = ((detected != 0U) && ((flags & VISION_STATUS_LOCKED) != 0U)) ? 1U : 0U;
+  }
+
+  new_state = (!detected) ? LCD_SHOW_SEARCHING : (!locked ? LCD_SHOW_ACQUIRING : LCD_SHOW_LOCKED);
+
+  target_name_take(name, sizeof(name));
+
+  if (lcd_shown_valid && (new_state == lcd_shown_state) &&
+      ((new_state != LCD_SHOW_LOCKED) || (strcmp(name, lcd_shown_name) == 0)))
+  {
+    return;   /* nothing the LCD needs to show has changed */
+  }
+
+  switch (new_state)
+  {
+    case LCD_SHOW_SEARCHING:
+      lcd_i2c_write_line(0U, "WATCHDOG CAR");
+      lcd_i2c_write_line(1U, "SEARCHING...");
+      break;
+
+    case LCD_SHOW_ACQUIRING:
+      lcd_i2c_write_line(0U, "TARGET FOUND");
+      lcd_i2c_write_line(1U, "ACQUIRING...");
+      break;
+
+    case LCD_SHOW_LOCKED:
+    default:
+      /* Upper-case, truncated to the 16-column width. name[] is already
+         bounded to TARGET_NAME_MAX_LEN (== LCD_I2C_COLS) characters, so
+         this loop can never overrun line1[]. */
+      for (i = 0U; (i < LCD_I2C_COLS) && (name[i] != '\0'); i++)
+      {
+        char c = name[i];
+        line1[i] = ((c >= 'a') && (c <= 'z')) ? (char)(c - 'a' + 'A') : c;
+      }
+      line1[i] = '\0';
+      lcd_i2c_write_line(0U, line1);
+      lcd_i2c_write_line(1U, "FOUND");
+      break;
+  }
+
+  lcd_shown_state = new_state;
+  lcd_shown_valid = 1U;
+  strncpy(lcd_shown_name, name, sizeof(lcd_shown_name) - 1U);
+  lcd_shown_name[sizeof(lcd_shown_name) - 1U] = '\0';
+}
+
 /* Simple two-wire L9110S channel: HIGH/LOW only, no PWM. One motor per channel.
    This is the permanent drivetrain abstraction - vision will call the
    motors_*() functions below directly once connected. */
@@ -963,6 +1116,7 @@ int main(void)
   MX_USART2_UART_Init();
   HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
   MX_TIM3_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   /* Report the reset cause once so a brownout/watchdog reset (e.g. from a stalled servo at its
      end-of-travel limit) is visible in the serial log instead of looking like a tracking reversal. */
@@ -1021,6 +1175,17 @@ int main(void)
                                (unsigned)TILT_PULSE_MIN_US, (unsigned)TILT_PULSE_MAX_US,
                                (int)(tilt_pulse_us - TILT_PULSE_MIN_US),
                                (int)(TILT_PULSE_MAX_US - tilt_pulse_us)));
+
+  /* Status LCD: one-time address probe + init, after homing so a slow/failed
+     I2C scan can never perturb servo homing timing. Graceful on failure -
+     lcd_i2c_is_present() stays false and every lcd_i2c_.. / lcd_status_update()
+     call becomes a no-op, so the rest of the robot runs unmodified with no
+     LCD attached. */
+  (void)lcd_i2c_probe_and_init(&hi2c1);
+  debug_send_blocking(snprintf(tx_buffer, sizeof(tx_buffer),
+                               "LCD %s addr=0x%02X\r\n",
+                               lcd_i2c_is_present() ? "found" : "not found",
+                               lcd_i2c_detected_address()));
 
 #if SERVO_SIGN_TEST
   /* ---- Open-loop direction test. Vision is ignored; watch the camera. --------------
@@ -1103,6 +1268,11 @@ int main(void)
 
     /* Detect/lock indicators. Pure GPIO writes - never gates or delays tracking. */
     status_leds_update(now);
+
+    /* Status LCD. Only touches I2C when the displayed state/text actually
+       changes (see lcd_status_update()), so this is cheap on every other
+       pass and a no-op entirely if no LCD was detected at boot. */
+    lcd_status_update(now);
 
     /* -------- The one and only periodic control loop, fixed 20 ms, non-blocking -------- */
     if ((now - last_control_tick) >= CONTROL_PERIOD_MS)
@@ -1285,6 +1455,30 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+  /* Conservative standard-mode speed (~100 kHz) - the PCF8574 LCD backpack
+     does not need and should not be pushed to fast mode. */
+  hi2c1.Instance             = I2C1;
+  hi2c1.Init.ClockSpeed      = LCD_I2C_CLOCK_HZ;
+  hi2c1.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1     = 0;
+  hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2     = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -1372,6 +1566,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         {
           uart_rx_state = WAIT_55;
         }
+        else if (rx_byte == TARGET_NAME_HDR1)
+        {
+          uart_rx_state = WAIT_NAME_A5;
+        }
         break;
 
       case WAIT_55:
@@ -1382,6 +1580,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else if (rx_byte == 0xAA)
         {
           uart_rx_state = WAIT_55;   /* "AA AA 55" - the second AA is the real header */
+        }
+        else if (rx_byte == TARGET_NAME_HDR1)
+        {
+          uart_rx_state = WAIT_NAME_A5;   /* a name header can follow directly after a stray AA */
         }
         else
         {
@@ -1403,7 +1605,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         else
         {
-          uart_rx_state = (rx_byte == 0xAA) ? WAIT_55 : WAIT_AA;
+          uart_rx_state = (rx_byte == 0xAA) ? WAIT_55 :
+                           ((rx_byte == TARGET_NAME_HDR1) ? WAIT_NAME_A5 : WAIT_AA);
         }
         break;
 
@@ -1451,6 +1654,85 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else
         {
           bad_checksum_count++;
+        }
+        uart_rx_state = WAIT_AA;
+        break;
+
+      /* ---- Target-name message: 0xA5 0x5A LEN name[LEN] checksum. Low
+         rate, distinct header from the tracking packet above, so it can
+         never be mistaken for one. See the framing note at TARGET_NAME_HDR1
+         in USER CODE BEGIN PD. ---------------------------------------- */
+      case WAIT_NAME_A5:
+        if (rx_byte == TARGET_NAME_HDR2)
+        {
+          uart_rx_state = WAIT_NAME_LEN;
+        }
+        else if (rx_byte == 0xAA)
+        {
+          uart_rx_state = WAIT_55;
+        }
+        else if (rx_byte == TARGET_NAME_HDR1)
+        {
+          uart_rx_state = WAIT_NAME_A5;   /* "A5 A5 5A" - the second A5 is the real header */
+        }
+        else
+        {
+          uart_rx_state = WAIT_AA;
+        }
+        break;
+
+      case WAIT_NAME_LEN:
+        /* Bounded to the LCD width: a LEN outside [1, TARGET_NAME_MAX_LEN]
+           can never index uart_name_payload[] out of bounds below. */
+        if ((rx_byte >= 1U) && (rx_byte <= TARGET_NAME_MAX_LEN))
+        {
+          uart_name_length   = rx_byte;
+          uart_name_index    = 0U;
+          uart_name_checksum = rx_byte;
+          uart_rx_state       = WAIT_NAME_PAYLOAD;
+        }
+        else if (rx_byte == 0xAA)
+        {
+          uart_rx_state = WAIT_55;
+        }
+        else if (rx_byte == TARGET_NAME_HDR1)
+        {
+          uart_rx_state = WAIT_NAME_A5;
+        }
+        else
+        {
+          uart_rx_state = WAIT_AA;
+        }
+        break;
+
+      case WAIT_NAME_PAYLOAD:
+        uart_name_payload[uart_name_index] = rx_byte;
+        uart_name_checksum ^= rx_byte;
+        uart_name_index++;
+        if (uart_name_index >= uart_name_length)
+        {
+          uart_rx_state = WAIT_NAME_CHECKSUM;
+        }
+        break;
+
+      case WAIT_NAME_CHECKSUM:
+        if (rx_byte == uart_name_checksum)
+        {
+          uint8_t name_i;
+
+          /* Written in one ISR pass, always null-terminated, never more
+             than TARGET_NAME_MAX_LEN characters: target_name_take() in the
+             main loop copies this out under a critical section so a name
+             arriving mid-read can never be observed half old/half new. */
+          for (name_i = 0U; name_i < uart_name_length; name_i++)
+          {
+            target_name_buffer[name_i] = (char)uart_name_payload[name_i];
+          }
+          target_name_buffer[uart_name_length] = '\0';
+        }
+        else
+        {
+          bad_name_checksum_count++;
         }
         uart_rx_state = WAIT_AA;
         break;
