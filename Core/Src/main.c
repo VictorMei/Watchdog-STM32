@@ -82,12 +82,6 @@ typedef struct
  *      err_y > 0  ->  target is BELOW  frame centre
  * =========================================================================== */
 
-/* ---- MPU6050: retained for later stabilisation work, unused by tracking ---- */
-#define MPU6050_ADDRESS       (0x68 << 1)
-#define MPU6050_WHO_AM_I      0x75
-#define MPU6050_PWR_MGMT_1    0x6B
-#define MPU6050_ACCEL_XOUT_H  0x3B
-
 /* ---- Hard travel limits. Every pulse written is clamped to these. ---------- */
 #define PAN_PULSE_MIN_US      700.0f
 #define PAN_PULSE_MAX_US      2300.0f
@@ -269,8 +263,6 @@ typedef struct
 #define FAILSAFE_TIMEOUT_MS   250U   /* older than this -> freeze in place (never re-centre) */
 
 /* ---- Build-time switches -------------------------------------------------- */
-#define MPU6050_POLLING_ENABLED 0    /* 0 while validating tracking: the blocking I2C read sat
-                                        directly in the control path.  Code is preserved intact. */
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
 #define TRACKING_DEBUG        1      /* 1 = one compact non-blocking status line per second - ON to diagnose "nothing moves" */
 
@@ -342,6 +334,26 @@ typedef struct
 #define MOTOR_RIGHT_PORT_2    MOTOR_A_PORT_2
 #define MOTOR_RIGHT_PIN_2     MOTOR_A_PIN_2
 #endif
+
+/* ---- Status LEDs on the Arduino header -------------------------------------
+     BLUE  = D2 = PA10 : a target is currently detected
+     GREEN = D3 = PB3  : the target has been detected for enough consecutive
+                         frames to count as confidently locked
+   The consecutive-frame counting lives in the Python vision program, which is
+   the only side that actually knows whether a frame contained a detection -
+   the STM32 is told the two resulting booleans and nothing more. Never infer
+   "detected" from servo position or image error here.
+   PB3 is a JTAG pin out of reset, but the CubeMX-generated HAL_MspInit()
+   already runs __HAL_AFIO_REMAP_SWJ_DISABLE() (project Debug = No Debug), so
+   it is an ordinary GPIO by the time MX_GPIO_Init() runs. */
+#define LED_BLUE_PORT         GPIOA
+#define LED_BLUE_PIN          GPIO_PIN_10   /* D2 */
+#define LED_GREEN_PORT        GPIOB
+#define LED_GREEN_PIN         GPIO_PIN_3    /* D3 */
+
+/* Bits of the optional 5th vision payload byte. */
+#define VISION_STATUS_DETECTED 0x01U
+#define VISION_STATUS_LOCKED   0x02U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -361,11 +373,13 @@ static uart_rx_state_t  uart_rx_state = WAIT_AA;
 static uint8_t          uart_rx_length;
 static uint8_t          uart_rx_index;
 static uint8_t          uart_rx_checksum;
-static uint8_t          uart_rx_payload[4];
+static uint8_t          uart_rx_payload[5];   /* 4 legacy bytes + optional status byte */
 
 volatile int16_t  target_err_x;
 volatile int16_t  target_err_y;
 volatile uint8_t  new_target_data;
+volatile uint8_t  vision_status_flags;     /* VISION_STATUS_* bits from the last 5-byte packet */
+volatile uint32_t last_status_tick;        /* when that status last arrived - drives the LED timeout */
 volatile uint32_t last_valid_packet_tick;
 volatile uint32_t valid_frames_received;
 volatile uint32_t bad_checksum_count;
@@ -403,13 +417,6 @@ static uint32_t pps_window_tick;
 static uint32_t pps_window_start;
 static uint32_t packets_per_second;
 #endif
-
-#if MPU6050_POLLING_ENABLED
-static uint8_t  mpu6050_ready;
-static uint8_t  mpu6050_data[14];
-static uint32_t last_imu_tick;
-static uint32_t last_mpu_led_tick;
-#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -429,6 +436,7 @@ static float   axis_apply(const axis_cfg_t *cfg, axis_ctl_t *axis, float filtere
 static uint8_t vision_take_sample(int16_t *err_x, int16_t *err_y, uint32_t *packet_tick);
 static void    tracking_update(uint32_t now);
 static void    uart_rx_keepalive(void);
+static void    status_leds_update(uint32_t now);
 static void    motors_stop(void);
 static void    motors_forward(void);
 static void    motors_backward(void);
@@ -742,6 +750,29 @@ static void uart_rx_keepalive(void)
   __set_PRIMASK(primask);
 }
 
+/* Two GPIO writes, no delays, no allocation - safe to call on every loop pass.
+   Both LEDs go dark once the vision side has stopped reporting status for
+   longer than the tracking failsafe window, so a dropped link can never leave
+   a stale "locked" indication lit. Green additionally requires detected, so a
+   malformed locked-without-detected status cannot light green alone. */
+static void status_leds_update(uint32_t now)
+{
+  uint8_t flags = vision_status_flags;
+  uint8_t blue  = 0U;
+  uint8_t green = 0U;
+
+  if ((now - last_status_tick) <= FAILSAFE_TIMEOUT_MS)
+  {
+    blue  = ((flags & VISION_STATUS_DETECTED) != 0U) ? 1U : 0U;
+    green = ((blue != 0U) && ((flags & VISION_STATUS_LOCKED) != 0U)) ? 1U : 0U;
+  }
+
+  HAL_GPIO_WritePin(LED_BLUE_PORT,  LED_BLUE_PIN,
+                    (blue  != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GREEN_PORT, LED_GREEN_PIN,
+                    (green != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
 /* Simple two-wire L9110S channel: HIGH/LOW only, no PWM. One motor per channel.
    This is the permanent drivetrain abstraction - vision will call the
    motors_*() functions below directly once connected. */
@@ -994,27 +1025,6 @@ int main(void)
   }
 #endif
 
-#if MPU6050_POLLING_ENABLED
-  {
-    uint8_t who_am_i = 0;
-    uint8_t wake_command = 0x00;
-
-    if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDRESS, MPU6050_WHO_AM_I,
-                         I2C_MEMADD_SIZE_8BIT, &who_am_i, 1, 100) == HAL_OK &&
-        who_am_i == 0x68 &&
-        HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDRESS, MPU6050_PWR_MGMT_1,
-                          I2C_MEMADD_SIZE_8BIT, &wake_command, 1, 100) == HAL_OK)
-    {
-      mpu6050_ready = 1;
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-    }
-    else
-    {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
-    }
-  }
-#endif
-
   /* Arm tracking last, from the calibrated position, with a clean slate. */
   filtered_err_x = 0.0f;
   filtered_err_y = 0.0f;
@@ -1024,6 +1034,8 @@ int main(void)
   comm_lost      = 1U;              /* nothing moves until a real packet arrives */
   last_control_tick = HAL_GetTick();
   last_valid_packet_tick = HAL_GetTick() - (FAILSAFE_TIMEOUT_MS + 1U);
+  vision_status_flags    = 0U;
+  last_status_tick       = HAL_GetTick() - (FAILSAFE_TIMEOUT_MS + 1U);
   new_target_data = 0U;
   uart_rx_state   = WAIT_AA;
   tracking_ready  = 1U;
@@ -1038,6 +1050,9 @@ int main(void)
 
     /* Keep the vision link alive: a single UART overrun used to kill reception forever. */
     uart_rx_keepalive();
+
+    /* Detect/lock indicators. Pure GPIO writes - never gates or delays tracking. */
+    status_leds_update(now);
 
     /* -------- The one and only periodic control loop, fixed 20 ms, non-blocking -------- */
     if ((now - last_control_tick) >= CONTROL_PERIOD_MS)
@@ -1258,7 +1273,19 @@ static void MX_GPIO_Init(void)
   __HAL_AFIO_REMAP_I2C1_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Status LEDs: D2 = PA10 (blue), D3 = PB3 (green). Both GPIO clocks are
+     already enabled above, and both LEDs start OFF. */
+  HAL_GPIO_WritePin(LED_BLUE_PORT,  LED_BLUE_PIN,  GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_GREEN_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
 
+  GPIO_InitStruct.Pin   = LED_BLUE_PIN;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_BLUE_PORT, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LED_GREEN_PIN;
+  HAL_GPIO_Init(LED_GREEN_PORT, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -1292,7 +1319,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         break;
 
       case WAIT_LEN:
-        if (rx_byte == 4U)
+        /* 4 = legacy "<hh" payload (err_x, err_y). 5 = the same plus a status
+           byte for the detect/lock LEDs. Both are accepted so the vision side
+           can be updated independently of the firmware, with no flag day and
+           no risk to tracking if an old build is running on either end. */
+        if ((rx_byte == 4U) || (rx_byte == 5U))
         {
           uart_rx_length   = rx_byte;
           uart_rx_index    = 0U;
@@ -1326,6 +1357,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
           last_valid_packet_tick = HAL_GetTick();
           new_target_data = 1U;
           valid_frames_received++;
+          if (uart_rx_length >= 5U)
+          {
+            /* Status is only refreshed by packets that actually carry it, so a
+               vision program still sending 4-byte frames leaves both LEDs dark
+               via the timeout rather than latching a stale state. */
+            vision_status_flags = uart_rx_payload[4];
+            last_status_tick    = last_valid_packet_tick;
+          }
           HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* LD2 flickers = vision link alive */
         }
         else
