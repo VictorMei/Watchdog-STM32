@@ -936,6 +936,7 @@ static void motor_hardware_test_run(void)
   */
 int main(void)
 {
+  uint8_t wiring_test_i;
 
   /* USER CODE BEGIN 1 */
 
@@ -974,6 +975,18 @@ int main(void)
                                __HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST) ? 1 : 0,
                                __HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST) ? 1 : 0));
   __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  /* Green-LED wiring self-test: blink it a few times unconditionally on every boot,
+     before vision/tracking data exists. If this never blinks, the problem is PB3
+     wiring/hardware, not the vision "locked" logic or the status_leds_update() gating
+     below - those can't be the cause of a blink that never happens at all. */
+  wiring_test_i = 0U;
+  for (; wiring_test_i < 6U; wiring_test_i++)
+  {
+    HAL_GPIO_TogglePin(LED_GREEN_PORT, LED_GREEN_PIN);
+    HAL_Delay(150U);
+  }
+  HAL_GPIO_WritePin(LED_GREEN_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
 
 #if MOTOR_HARDWARE_TEST
   /* Temporary standalone drive-motor bring-up: runs once, then halts forever.
