@@ -58,6 +58,32 @@ typedef struct
   int8_t   err_sign;         /* which side of centre the error was on last sample */
 } axis_ctl_t;
 
+/* What the autonomous follower last commanded the drivetrain to do. Kept so the
+   decision is visible in the debug line and so an unchanged decision does not
+   re-write the four motor GPIOs every control pass. STOP is the safe value and
+   the one this starts at. */
+typedef enum
+{
+  DRIVE_STOP = 0,
+  DRIVE_LEFT,
+  DRIVE_RIGHT,
+  DRIVE_FORWARD
+} drive_state_t;
+
+/* One coherent snapshot of everything the follower decides on, taken in a single
+   critical section. Unlike vision_take_sample() this does NOT consume
+   new_target_data - the pan/tilt controller owns that flag and must keep being the
+   only consumer of it, or one of the two loops would silently eat the other's
+   frames. */
+typedef struct
+{
+  int16_t  err_x;
+  uint8_t  size_pct;
+  uint8_t  flags;
+  uint32_t packet_tick;
+  uint32_t status_tick;
+} vehicle_vision_t;
+
 /* Everything that differs between pan and tilt, in ONE place. This exists because of the
    2026-09-15 bug: tilt was running at 1.5x pan's gain with 2/3 of its damping and a
    per-step cap nine times larger relative to its own travel, and none of that was visible
@@ -365,6 +391,43 @@ typedef struct
 #define VISION_STATUS_DETECTED 0x01U
 #define VISION_STATUS_LOCKED   0x02U
 
+/* ---- Autonomous target following (drivetrain) ------------------------------
+   OFF by default and deliberately so: with this at 0 vehicle_follow_update()
+   does nothing but hold the motors stopped, so the car behaves exactly as it
+   did before this feature existed and pan/tilt tracking is the only thing
+   moving. Flip to 1 only with the car on blocks first.
+
+   The follower is a pure function of the vision state - it never looks at servo
+   position - and it runs in the normal 20 ms control loop, never in the RX ISR.
+
+   Decision priority, in this exact order (see vehicle_follow_update()):
+       1. autonomous drive disabled        -> STOP
+       2. not homed / stale vision / not locked -> STOP
+       3. target significantly LEFT        -> TURN LEFT
+       4. target significantly RIGHT       -> TURN RIGHT
+       5. centred and target still small   -> FORWARD
+       6. centred and target big enough    -> STOP
+   Steering outranks driving: the car never turns and drives at the same time. */
+#define AUTONOMOUS_DRIVE_ENABLED 0
+
+/* Horizontal dead-band, in PIXELS of err_x, inside which the car is considered
+   pointed at the target and may consider driving. Deliberately much wider than
+   PAN_DEADBAND_PX (35): the camera head steers itself continuously on that axis,
+   so the chassis only needs to follow the head coarsely. Too small and the car
+   pivots back and forth forever instead of ever driving. */
+#define CAR_X_DEADBAND         80
+
+/* Stop-distance threshold as a percentage of frame height occupied by the
+   target's bounding box. Bigger box = closer target. Below this the car closes
+   in; at or above it the car holds station. There is deliberately no reverse
+   band yet - being too close only ever means STOP. */
+#define TARGET_STOP_PCT        45U
+
+/* A size byte of 0 means "not reported" (a 4- or 5-byte packet from an older
+   vision program) as well as "nothing detected". Either way it is not a distance
+   measurement, so it must never authorise forward motion. */
+#define TARGET_SIZE_PCT_MAX    100U
+
 /* ---- 16x2 status LCD (PCF8574 I2C backpack, HD44780) -----------------------
    I2C1 is remapped onto PB8 (SCL) / PB9 (SDA) - see MX_GPIO_Init(). This
    reuses the I2C1 bus originally wired for the (currently deferred) MPU6050;
@@ -404,7 +467,7 @@ static uart_rx_state_t  uart_rx_state = WAIT_AA;
 static uint8_t          uart_rx_length;
 static uint8_t          uart_rx_index;
 static uint8_t          uart_rx_checksum;
-static uint8_t          uart_rx_payload[5];   /* 4 legacy bytes + optional status byte */
+static uint8_t          uart_rx_payload[6];   /* 4 legacy bytes + optional status byte + optional size byte */
 
 /* ---- Target-name message parsing, ISR-side. Shares the RX byte stream and
    ISR with the tracking parser above but keeps fully separate state, since
@@ -421,6 +484,7 @@ volatile int16_t  target_err_y;
 volatile uint8_t  new_target_data;
 volatile uint8_t  target_detected;         /* did the frame behind target_err_* actually contain a target? */
 volatile uint8_t  vision_status_flags;     /* VISION_STATUS_* bits from the last 5-byte packet */
+volatile uint8_t  target_size_pct;         /* 100*box_height/frame_height from the 6th payload byte; 0 = not reported */
 volatile uint32_t last_status_tick;        /* when that status last arrived - drives the LED timeout */
 volatile uint32_t last_valid_packet_tick;
 volatile uint32_t valid_frames_received;
@@ -464,8 +528,18 @@ static char               lcd_shown_name[TARGET_NAME_MAX_LEN + 1];
 /* ---- Loop scheduling ------------------------------------------------------- */
 static uint32_t last_control_tick;
 
+/* ---- Autonomous follower state: the last command actually issued to the
+   drivetrain, so an unchanged decision is not re-written to the motor GPIOs on
+   every pass, and so the debug line can show what the car is doing. ---------- */
+static drive_state_t vehicle_drive_state = DRIVE_STOP;
+static uint8_t       vehicle_drive_valid;   /* 0 until the first command is issued */
+
 /* ---- Debug / telemetry (never in the control path) ------------------------- */
-static char     tx_buffer[192];  /* sized for the widest TRACKING_DEBUG line below */
+/* Sized for the TRACKING_DEBUG line's true worst case (~247 bytes: every %lu/%d
+   at full 32-bit width), not for its typical ~110. snprintf() truncates safely
+   either way, but at 192 the line could silently lose its tail fields - which are
+   the newest and most interesting ones - on a long uptime with large counters. */
+static char     tx_buffer[256];
 #if TRACKING_DEBUG
 static uint32_t last_report_tick;
 static uint32_t pps_window_tick;
@@ -501,6 +575,9 @@ static void    motors_forward(void);
 static void    motors_backward(void);
 static void    motors_turn_left(void);
 static void    motors_turn_right(void);
+static void    vehicle_take_state(vehicle_vision_t *out);
+static void    vehicle_drive_command(drive_state_t want);
+static void    vehicle_follow_update(uint32_t now);
 #if MOTOR_HARDWARE_TEST
 static void    motor_hardware_test_run(void);
 #endif
@@ -1055,6 +1132,163 @@ static void motors_turn_right(void)
              MOTOR_DIR_BWD, MOTOR_RIGHT_REVERSED);
 }
 
+/* ---------------------------------------------------------------------------
+ *  Autonomous target following.
+ *
+ *  This is the ONLY code that drives the wheels during normal operation. It is
+ *  called from the 20 ms control loop, never from the RX ISR - the ISR's whole
+ *  job stays "update state, return", so a burst of serial traffic can never turn
+ *  into a burst of motor commands.
+ *
+ *  It shares the pan/tilt controller's vision state but not its plumbing: it
+ *  takes its own snapshot (vehicle_take_state) rather than calling
+ *  vision_take_sample(), because that function CONSUMES new_target_data and the
+ *  tracking loop must remain its only consumer.
+ *
+ *  Safety properties this function is required to have, in one place:
+ *    - every path that is not "locked, fresh and pointed at the target" ends in
+ *      motors_stop(); the default is stop, not "keep doing the last thing";
+ *    - a stale tracking packet, a stale status byte, a lost lock or a lost link
+ *      all stop the car on the very next pass (<= CONTROL_PERIOD_MS later);
+ *    - a missing or zero size byte can never authorise forward motion;
+ *    - no HAL_Delay(), no blocking I/O, no allocation.
+ * ------------------------------------------------------------------------- */
+
+/* One coherent read of the vision state. Same critical-section reasoning as
+   vision_take_sample(): err_x, the size byte and the status flags are written by
+   the ISR at different points in the same packet, so reading them unprotected
+   could pair one frame's steering error with another frame's lock state. */
+static void vehicle_take_state(vehicle_vision_t *out)
+{
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  out->err_x       = target_err_x;
+  out->size_pct    = target_size_pct;
+  out->flags       = vision_status_flags;
+  out->packet_tick = last_valid_packet_tick;
+  out->status_tick = last_status_tick;
+  __set_PRIMASK(primask);
+}
+
+/* Issue a drivetrain command through the existing motors_*() helpers, skipping
+   the GPIO writes when the decision has not changed. The skip is an efficiency
+   detail only and must never weaken the failsafe: vehicle_drive_valid starts at
+   0 so the very first decision is always written out, and every stop path below
+   routes through here with DRIVE_STOP. */
+static void vehicle_drive_command(drive_state_t want)
+{
+  if (vehicle_drive_valid && (want == vehicle_drive_state))
+  {
+    return;
+  }
+
+  switch (want)
+  {
+    case DRIVE_LEFT:     motors_turn_left();  break;
+    case DRIVE_RIGHT:    motors_turn_right(); break;
+    case DRIVE_FORWARD:  motors_forward();    break;
+    case DRIVE_STOP:
+    default:             motors_stop();       break;
+  }
+
+  vehicle_drive_state = want;
+  vehicle_drive_valid = 1U;
+}
+
+static void vehicle_follow_update(uint32_t now)
+{
+  vehicle_vision_t vis;
+  uint8_t          detected;
+  uint8_t          locked;
+
+  /* Priority 1: the feature is off. Hold the wheels stopped rather than simply
+     returning, so this build actively parks the drivetrain instead of leaving
+     whatever a bring-up test or a glitch last left on the pins.
+     Written as a plain if on the macro rather than #if deliberately: the
+     constant folds and the compiler drops everything below it just as an #if
+     would, but the disabled build still TYPE-CHECKS the whole follower. An #if
+     here would let the enabled path rot unnoticed for as long as the default
+     build has it switched off, which is exactly how long it will sit at 0. */
+  if (!AUTONOMOUS_DRIVE_ENABLED)
+  {
+    vehicle_drive_command(DRIVE_STOP);
+    return;
+  }
+
+  /* Priority 2: anything short of a fresh, confidently locked target is a STOP.
+     The car must never drive on a guess.
+
+     "Fresh" is checked on BOTH timestamps against the same FAILSAFE_TIMEOUT_MS
+     the tracking loop and the LEDs use, because they can go stale independently:
+     last_valid_packet_tick dying means the link is gone, while last_status_tick
+     dying alone means the link is up but the vision side has fallen back to
+     packets that carry no detect/lock state - and a car may not drive on a
+     packet that cannot tell it whether there is a target. Both being stale also
+     covers "vision process exited": the flags simply stop being refreshed and
+     this goes to STOP within one control period.
+
+     locked requires detected as well, exactly as status_leds_update() and
+     lcd_status_update() do, so a malformed locked-without-detected byte cannot
+     put the car in motion when the LEDs would call it "no target". */
+  if (!tracking_ready)
+  {
+    vehicle_drive_command(DRIVE_STOP);   /* still homing the servos */
+    return;
+  }
+
+  vehicle_take_state(&vis);
+
+  if (((now - vis.packet_tick) > FAILSAFE_TIMEOUT_MS) ||
+      ((now - vis.status_tick) > FAILSAFE_TIMEOUT_MS))
+  {
+    vehicle_drive_command(DRIVE_STOP);   /* stale vision - link or status timed out */
+    return;
+  }
+
+  detected = ((vis.flags & VISION_STATUS_DETECTED) != 0U) ? 1U : 0U;
+  locked   = ((detected != 0U) && ((vis.flags & VISION_STATUS_LOCKED) != 0U)) ? 1U : 0U;
+
+  if (!locked)
+  {
+    /* No target at all, or detected but not yet through the vision side's
+       consecutive-frame lock rule. Either way the car stays put. */
+    vehicle_drive_command(DRIVE_STOP);
+    return;
+  }
+
+  /* Priorities 3 and 4: steering outranks driving. While the target is outside
+     the horizontal dead-band the car only ever pivots - it never tries to turn
+     and drive forward at the same time.
+     Sign convention is the vision side's and matches pan/tilt: err_x > 0 means
+     the target is RIGHT of frame centre. */
+  if (vis.err_x < -CAR_X_DEADBAND)
+  {
+    vehicle_drive_command(DRIVE_LEFT);
+    return;
+  }
+
+  if (vis.err_x > CAR_X_DEADBAND)
+  {
+    vehicle_drive_command(DRIVE_RIGHT);
+    return;
+  }
+
+  /* Priorities 5 and 6: pointed at the target, so use its apparent size as the
+     distance estimate. A bigger box means a closer target.
+     size_pct == 0 means the vision side never reported a size (a 4- or 5-byte
+     packet), so there is no distance information at all and forward motion is
+     refused - that is what keeps a firmware-newer-than-vision pairing safe. */
+  if ((vis.size_pct > 0U) && (vis.size_pct < TARGET_STOP_PCT))
+  {
+    vehicle_drive_command(DRIVE_FORWARD);
+    return;
+  }
+
+  /* Close enough, or no trustworthy size. Deliberately no reverse band yet. */
+  vehicle_drive_command(DRIVE_STOP);
+}
+
 #if MOTOR_HARDWARE_TEST
 /* One-shot drivetrain bring-up test: exercises the motors_*() helpers
    themselves (not raw channels) so the FUNCTION NAMES can be checked against
@@ -1252,8 +1486,15 @@ int main(void)
   target_detected        = 0U;
   last_status_tick       = HAL_GetTick() - (FAILSAFE_TIMEOUT_MS + 1U);
   new_target_data = 0U;
+  target_size_pct = 0U;             /* no distance information until a 6-byte packet lands */
   uart_rx_state   = WAIT_AA;
   tracking_ready  = 1U;
+  /* Park the drivetrain explicitly before the loop starts, whatever the pins were
+     left holding. vehicle_drive_valid = 0 forces the first vehicle_follow_update()
+     call to write the motor GPIOs rather than assume they already agree. */
+  vehicle_drive_state = DRIVE_STOP;
+  vehicle_drive_valid = 0U;
+  motors_stop();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1279,6 +1520,13 @@ int main(void)
     {
       last_control_tick = now;
       tracking_update(now);
+
+      /* Autonomous following. Runs in the normal control loop, after the camera
+         head has been updated and never from the RX ISR. Compiled to nothing but
+         a held stop while AUTONOMOUS_DRIVE_ENABLED is 0. Because it runs every
+         control period, a lost lock or a dead link stops the wheels within
+         CONTROL_PERIOD_MS. */
+      vehicle_follow_update(now);
     }
 
 #if TRACKING_DEBUG
@@ -1305,9 +1553,13 @@ int main(void)
          vision side is still sending 4-byte packets and the firmware is correctly
          holding both LEDs dark, flg=0x01 means detected-but-never-locked (the lock
          rule on the Python side never fires), and flg=0x03 with no green LED is the
-         only combination that points back at this firmware. */
+         only combination that points back at this firmware.
+         sz= is the 6th payload byte (0 = the vision side is not sending one, so
+         autonomous forward motion is refused) and drv= is what the follower last
+         commanded: STP/LFT/RGT/FWD. drv= reads STP permanently while
+         AUTONOMOUS_DRIVE_ENABLED is 0, which is the default. */
       debug_send_async(snprintf(tx_buffer, sizeof(tx_buffer),
-                                "T pps=%lu age=%lu flg=0x%02X sage=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d bad=%lu err=%lu\r\n",
+                                "T pps=%lu age=%lu flg=0x%02X sage=%lu ex=%d ey=%d pan=%u tilt=%u gp=%u gt=%u ifp=%d ift=%d up=%d sz=%u drv=%s bad=%lu err=%lu\r\n",
                                 (unsigned long)packets_per_second,
                                 (unsigned long)(now - last_valid_packet_tick),
                                 (unsigned)vision_status_flags,
@@ -1319,6 +1571,10 @@ int main(void)
                                 (int)pan_ctl.inflight_us,
                                 (int)tilt_ctl.inflight_us,
                                 (int)(tilt_pulse_us - TILT_PULSE_MIN_US),
+                                (unsigned)target_size_pct,
+                                (vehicle_drive_state == DRIVE_FORWARD) ? "FWD" :
+                                  ((vehicle_drive_state == DRIVE_LEFT)  ? "LFT" :
+                                  ((vehicle_drive_state == DRIVE_RIGHT) ? "RGT" : "STP")),
                                 (unsigned long)bad_checksum_count,
                                 (unsigned long)uart_error_count));
     }
@@ -1593,10 +1849,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
       case WAIT_LEN:
         /* 4 = legacy "<hh" payload (err_x, err_y). 5 = the same plus a status
-           byte for the detect/lock LEDs. Both are accepted so the vision side
+           byte for the detect/lock LEDs. 6 = the same plus a target-size byte
+           for autonomous following. All three are accepted so the vision side
            can be updated independently of the firmware, with no flag day and
-           no risk to tracking if an old build is running on either end. */
-        if ((rx_byte == 4U) || (rx_byte == 5U))
+           no risk to tracking if an old build is running on either end.
+           The safety consequence of an older vision program is contained in one
+           place: LEN < 6 leaves target_size_pct at 0 below, and a size of 0
+           forbids autonomous forward motion in vehicle_follow_update(). */
+        if ((rx_byte >= 4U) && (rx_byte <= 6U))
         {
           uart_rx_length   = rx_byte;
           uart_rx_index    = 0U;
@@ -1648,6 +1908,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                that protocol only ever sent a packet when it HAD a target, so treating
                it as detected preserves the old behaviour exactly. */
             target_detected = 1U;
+          }
+          /* 6th byte: 100 * box_height / frame_height, i.e. how much of the frame
+             the target fills - the only distance cue the car has. Set on EVERY
+             accepted tracking packet, never left latched: a link that drops back
+             to 4- or 5-byte frames must clear it to 0 rather than keep an old
+             value, because a stale size would otherwise let the car keep driving
+             toward a distance measurement that no longer exists. Clamped to 100
+             so a malformed byte cannot read as "absurdly far away" either. */
+          if (uart_rx_length >= 6U)
+          {
+            target_size_pct = (uart_rx_payload[5] <= TARGET_SIZE_PCT_MAX) ?
+                                uart_rx_payload[5] : (uint8_t)TARGET_SIZE_PCT_MAX;
+          }
+          else
+          {
+            target_size_pct = 0U;
           }
           HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);   /* LD2 flickers = vision link alive */
         }
