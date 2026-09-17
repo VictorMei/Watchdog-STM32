@@ -296,7 +296,38 @@ typedef struct
 #define RING_GAIN_MIN         0.35f  /* never cut below this - it must still be able to track */
 #define RING_GAIN_RECOVER     0.010f /* handed back per settled sample: ~4 s floor -> 1.0 */
 #define CONTROL_PERIOD_MS     20U    /* maximum control rate; a step needs a FRESH sample too */
-#define FAILSAFE_TIMEOUT_MS   250U   /* older than this -> freeze in place (never re-centre) */
+
+/* How old the newest vision packet may be before the link counts as dead. It
+   gates four things at once, deliberately, so they can never disagree about
+   whether there is a target: the pan/tilt freeze in tracking_update(), the two
+   status LEDs, the LCD, and autonomous forward motion in
+   vehicle_follow_update().
+
+   THIS IS A LINK-DEATH DETECTOR, NOT A TARGET-LOST DETECTOR, and the two are
+   already separate. A packet that arrives saying "not detected" or "not
+   locked" stops the car on the very next control pass (<= 20 ms) through the
+   status bits, with no reference to this timeout at all. So the only thing
+   this number decides is how long to wait for a packet that never comes -
+   which means it must clear the slowest HEALTHY frame interval by a margin,
+   and nothing more.
+
+   Was 250 ms, which was wrong for the hardware this actually runs on: the Pi 4
+   does YOLO on the CPU with no accelerator, and at 640 px it needs roughly
+   400-700 ms per frame - so a perfectly healthy vision feed timed out between
+   almost every frame. Symptoms were both LEDs and the LCD flickering in step
+   with the frame rate, and the follower stopping and restarting continuously
+   rather than driving. (The vision side now runs at 320 px, ~150-250 ms per
+   frame; see DEFAULT_IMGSZ in the Pi's vision/detector.py.)
+
+   800 ms is about 3-5 healthy frames at 320 px and still clears one frame at
+   640 px, so it survives a dropped frame or a GC pause without ever masking a
+   dead link: an unplugged cable or a killed vision process stops the wheels in
+   at most 800 ms + one control period. At the pivot/creep speeds this car
+   drives that is a short coast, not a runaway.
+
+   If the Pi's frame rate changes, re-check this against the runner's PERF line
+   (it prints the measured interval) and keep it at roughly 3-4x that. */
+#define FAILSAFE_TIMEOUT_MS   800U   /* older than this -> freeze in place (never re-centre) */
 
 /* ---- Build-time switches -------------------------------------------------- */
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
@@ -408,7 +439,7 @@ typedef struct
        5. centred and target still small   -> FORWARD
        6. centred and target big enough    -> STOP
    Steering outranks driving: the car never turns and drives at the same time. */
-#define AUTONOMOUS_DRIVE_ENABLED 0
+#define AUTONOMOUS_DRIVE_ENABLED 1
 
 /* Horizontal dead-band, in PIXELS of err_x, inside which the car is considered
    pointed at the target and may consider driving. Deliberately much wider than
@@ -1549,7 +1580,8 @@ int main(void)
          (TILT_TRIM_US / the bracket), not tuning. The two look alike on camera and have
          opposite fixes, so check this field before touching a gain.
          flg= is the raw 5th payload byte and sage= is how long ago one last arrived.
-         Read them together before blaming the LEDs: sage climbing past 250 means the
+         Read them together before blaming the LEDs: sage climbing past
+         FAILSAFE_TIMEOUT_MS means the
          vision side is still sending 4-byte packets and the firmware is correctly
          holding both LEDs dark, flg=0x01 means detected-but-never-locked (the lock
          rule on the Python side never fires), and flg=0x03 with no green LED is the
