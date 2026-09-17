@@ -330,7 +330,9 @@ typedef struct
    time in the stale-vision STOP branch and the car never moved. If the Pi's
    frame rate changes, re-check this against the runner's PERF line (it prints
    the measured interval) and keep it at roughly 3-4x that. */
-#define FAILSAFE_TIMEOUT_MS   4000U  /* older than this -> freeze in place (never re-centre) */
+   If the Pi's frame rate changes, re-check this against the runner's PERF line
+   (it prints the measured interval) and keep it at roughly 3-4x that. */
+#define FAILSAFE_TIMEOUT_MS   4000U   /* older than this -> freeze in place (never re-centre) */
 
 /* ---- Build-time switches -------------------------------------------------- */
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
@@ -1316,7 +1318,8 @@ static void vehicle_follow_update(uint32_t now)
 
   if (!detected)
   {
-    /* Nothing seen on the most recent fresh frame - the car stays put. */
+    /* No target at all. Movement is authorized by DETECTED alone; the
+       vision side's consecutive-frame LOCKED rule is not required to drive. */
     vehicle_drive_command(DRIVE_STOP);
     return;
   }
