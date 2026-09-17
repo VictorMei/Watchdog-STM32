@@ -67,7 +67,8 @@ typedef enum
   DRIVE_STOP = 0,
   DRIVE_LEFT,
   DRIVE_RIGHT,
-  DRIVE_FORWARD
+  DRIVE_FORWARD,
+  DRIVE_BACKWARD
 } drive_state_t;
 
 /* One coherent snapshot of everything the follower decides on, taken in a single
@@ -330,8 +331,6 @@ typedef struct
    time in the stale-vision STOP branch and the car never moved. If the Pi's
    frame rate changes, re-check this against the runner's PERF line (it prints
    the measured interval) and keep it at roughly 3-4x that. */
-   If the Pi's frame rate changes, re-check this against the runner's PERF line
-   (it prints the measured interval) and keep it at roughly 3-4x that. */
 #define FAILSAFE_TIMEOUT_MS   4000U   /* older than this -> freeze in place (never re-centre) */
 
 /* ---- Build-time switches -------------------------------------------------- */
@@ -474,6 +473,24 @@ typedef struct
    measurement, so it must never authorise forward motion. */
 #define TARGET_SIZE_PCT_MAX    100U
 
+/* ---- Autonomous drive mode select ------------------------------------------
+   0: ignore vision entirely and drive a fixed, timed test route (see
+      vehicle_route_test_update()) - forward, then right, then left (straightening
+      back out), then backward. Useful for validating the drivetrain end-to-end
+      without a working vision link.
+   1: normal behavior - follow the vision target, exactly as vehicle_follow_update()
+      is documented above.
+   Only consulted while AUTONOMOUS_DRIVE_ENABLED is 1; has no effect otherwise. */
+#define VEHICLE_TEST_MODE      1
+
+/* Phase durations for the VEHICLE_TEST_MODE == 0 route, in milliseconds. The
+   sequence runs once starting at the first control loop pass and then holds
+   STOP - it does not repeat. */
+#define ROUTE_TEST_FORWARD_MS  3000U
+#define ROUTE_TEST_RIGHT_MS    2000U
+#define ROUTE_TEST_LEFT_MS     2000U
+#define ROUTE_TEST_BACKWARD_MS 3000U
+
 /* ---- 16x2 status LCD (PCF8574 I2C backpack, HD44780) -----------------------
    I2C1 is remapped onto PB8 (SCL) / PB9 (SDA) - see MX_GPIO_Init(). This
    reuses the I2C1 bus originally wired for the (currently deferred) MPU6050;
@@ -580,6 +597,14 @@ static uint32_t last_control_tick;
 static drive_state_t vehicle_drive_state = DRIVE_STOP;
 static uint8_t       vehicle_drive_valid;   /* 0 until the first command is issued */
 
+/* ---- VEHICLE_TEST_MODE == 0 fixed-route state: which phase of the canned
+   sequence is running and when it started, so vehicle_route_test_update() can
+   stay non-blocking (no HAL_Delay()) and compare elapsed time against the
+   ROUTE_TEST_*_MS durations on every control pass. ------------------------- */
+static uint8_t  route_test_started;      /* 0 until the first control pass */
+static uint8_t  route_test_phase;        /* 0=FWD 1=RIGHT 2=LEFT 3=BACKWARD 4=done */
+static uint32_t route_test_phase_tick;
+
 /* ---- Debug / telemetry (never in the control path) ------------------------- */
 /* Sized for the TRACKING_DEBUG line's true worst case (~247 bytes: every %lu/%d
    at full 32-bit width), not for its typical ~110. snprintf() truncates safely
@@ -623,6 +648,7 @@ static void    motors_turn_left(void);
 static void    motors_turn_right(void);
 static void    vehicle_take_state(vehicle_vision_t *out);
 static void    vehicle_drive_command(drive_state_t want);
+static void    vehicle_route_test_update(uint32_t now);
 static void    vehicle_follow_update(uint32_t now);
 #if MOTOR_HARDWARE_TEST
 static void    motor_hardware_test_run(void);
@@ -1251,12 +1277,74 @@ static void vehicle_drive_command(drive_state_t want)
     case DRIVE_LEFT:     motors_turn_left();  break;
     case DRIVE_RIGHT:    motors_turn_right(); break;
     case DRIVE_FORWARD:  motors_forward();    break;
+    case DRIVE_BACKWARD: motors_backward();   break;
     case DRIVE_STOP:
     default:             motors_stop();       break;
   }
 
   vehicle_drive_state = want;
   vehicle_drive_valid = 1U;
+}
+
+/* Fixed drivetrain test route, selected by VEHICLE_TEST_MODE == 0. Ignores
+   vision entirely and drives forward, then right, then left (straightening
+   back out), then backward, each for its ROUTE_TEST_*_MS duration, then holds
+   STOP. Runs once per boot - it does not repeat.
+   Non-blocking like vehicle_follow_update(): no HAL_Delay(), just a comparison
+   of HAL_GetTick() against a per-phase start tick on every 20 ms control pass. */
+static void vehicle_route_test_update(uint32_t now)
+{
+  if (!route_test_started)
+  {
+    route_test_started   = 1U;
+    route_test_phase      = 0U;
+    route_test_phase_tick = now;
+    vehicle_drive_command(DRIVE_FORWARD);
+  }
+
+  switch (route_test_phase)
+  {
+    case 0U:
+      if ((now - route_test_phase_tick) >= ROUTE_TEST_FORWARD_MS)
+      {
+        route_test_phase      = 1U;
+        route_test_phase_tick = now;
+        vehicle_drive_command(DRIVE_RIGHT);
+      }
+      break;
+
+    case 1U:
+      if ((now - route_test_phase_tick) >= ROUTE_TEST_RIGHT_MS)
+      {
+        route_test_phase      = 2U;
+        route_test_phase_tick = now;
+        vehicle_drive_command(DRIVE_LEFT);
+      }
+      break;
+
+    case 2U:
+      if ((now - route_test_phase_tick) >= ROUTE_TEST_LEFT_MS)
+      {
+        route_test_phase      = 3U;
+        route_test_phase_tick = now;
+        vehicle_drive_command(DRIVE_BACKWARD);
+      }
+      break;
+
+    case 3U:
+      if ((now - route_test_phase_tick) >= ROUTE_TEST_BACKWARD_MS)
+      {
+        route_test_phase      = 4U;
+        route_test_phase_tick = now;
+        vehicle_drive_command(DRIVE_STOP);
+      }
+      break;
+
+    case 4U:
+    default:
+      /* Sequence complete: hold stop. */
+      break;
+  }
 }
 
 static void vehicle_follow_update(uint32_t now)
@@ -1275,6 +1363,16 @@ static void vehicle_follow_update(uint32_t now)
   if (!AUTONOMOUS_DRIVE_ENABLED)
   {
     vehicle_drive_command(DRIVE_STOP);
+    return;
+  }
+
+  /* Priority 1b: VEHICLE_TEST_MODE selects the fixed test route instead of
+     vision-follow, for validating the drivetrain without a working vision
+     link. Same plain-if-on-the-macro reasoning as above: both bodies stay
+     type-checked regardless of which one the build actually runs. */
+  if (!VEHICLE_TEST_MODE)
+  {
+    vehicle_route_test_update(now);
     return;
   }
 
@@ -1640,9 +1738,10 @@ int main(void)
                                 (int)tilt_ctl.inflight_us,
                                 (int)(tilt_pulse_us - TILT_PULSE_MIN_US),
                                 (unsigned)target_size_pct,
-                                (vehicle_drive_state == DRIVE_FORWARD) ? "FWD" :
-                                  ((vehicle_drive_state == DRIVE_LEFT)  ? "LFT" :
-                                  ((vehicle_drive_state == DRIVE_RIGHT) ? "RGT" : "STP")),
+                                (vehicle_drive_state == DRIVE_FORWARD)  ? "FWD" :
+                                  ((vehicle_drive_state == DRIVE_LEFT)     ? "LFT" :
+                                  ((vehicle_drive_state == DRIVE_RIGHT)    ? "RGT" :
+                                  ((vehicle_drive_state == DRIVE_BACKWARD) ? "BWD" : "STP"))),
                                 (unsigned long)bad_checksum_count,
                                 (unsigned long)uart_error_count));
     }
