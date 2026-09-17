@@ -451,7 +451,8 @@ typedef struct
        3. target significantly LEFT        -> TURN LEFT
        4. target significantly RIGHT       -> TURN RIGHT
        5. centred and target still small   -> FORWARD
-       6. centred and target big enough    -> STOP
+       6. centred and target too close      -> BACKWARD
+       7. centred and target in the hold band -> STOP
    Steering outranks driving: the car never turns and drives at the same time. */
 #define AUTONOMOUS_DRIVE_ENABLED 1
 
@@ -462,11 +463,11 @@ typedef struct
    pivots back and forth forever instead of ever driving. */
 #define CAR_X_DEADBAND         80
 
-/* Stop-distance threshold as a percentage of frame height occupied by the
-   target's bounding box. Bigger box = closer target. Below this the car closes
-   in; at or above it the car holds station. There is deliberately no reverse
-   band yet - being too close only ever means STOP. */
+/* Distance hysteresis as a percentage of frame height occupied by the target's
+    bounding box. Bigger box = closer target. Separate thresholds prevent the
+    car from rapidly changing between forward and backward at one boundary. */
 #define TARGET_STOP_PCT        45U
+#define TARGET_REVERSE_PCT     60U
 
 /* A size byte of 0 means "not reported" (a 4- or 5-byte packet from an older
    vision program) as well as "nothing detected". Either way it is not a distance
@@ -966,8 +967,20 @@ static void tracking_update(uint32_t now)
   pan_ctl.inflight_us  *= decay;
   tilt_ctl.inflight_us *= decay;
 
-  pan_pulse_us  = axis_apply(&pan_cfg,  &pan_ctl,  filtered_err_x, pan_pulse_us,
-                             rate_scale, now);
+  /* Horizontal authority is handed to the drivetrain while the target is
+     outside its steering band. Letting the pan servo and the car correct the
+     same error at once creates a moving reference and can make the car
+     over-rotate. Hold the camera angle during the pivot; pan resumes for fine
+     correction once the car has brought the target near centre. */
+  if (abs_f((float)raw_x) > CAR_X_DEADBAND)
+  {
+    pan_ctl.inflight_us = 0.0f;
+  }
+  else
+  {
+    pan_pulse_us = axis_apply(&pan_cfg, &pan_ctl, filtered_err_x, pan_pulse_us,
+                              rate_scale, now);
+  }
   tilt_pulse_us = axis_apply(&tilt_cfg, &tilt_ctl, filtered_err_y, tilt_pulse_us,
                              rate_scale, now);
 
@@ -1439,7 +1452,7 @@ static void vehicle_follow_update(uint32_t now)
     return;
   }
 
-  /* Priorities 5 and 6: pointed at the target, so use its apparent size as the
+  /* Priorities 5-7: pointed at the target, so use its apparent size as the
      distance estimate. A bigger box means a closer target.
      size_pct == 0 means the vision side never reported a size (a 4- or 5-byte
      packet), so there is no distance information at all and forward motion is
@@ -1450,7 +1463,13 @@ static void vehicle_follow_update(uint32_t now)
     return;
   }
 
-  /* Close enough, or no trustworthy size. Deliberately no reverse band yet. */
+  if (vis.size_pct >= TARGET_REVERSE_PCT)
+  {
+    vehicle_drive_command(DRIVE_BACKWARD);
+    return;
+  }
+
+  /* In the hold band, or with no trustworthy size, remain stopped. */
   vehicle_drive_command(DRIVE_STOP);
 }
 
