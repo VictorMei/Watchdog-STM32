@@ -1274,8 +1274,8 @@ static void vehicle_drive_command(drive_state_t want)
 
   switch (want)
   {
-    case DRIVE_LEFT:     motors_turn_left();  break;
-    case DRIVE_RIGHT:    motors_turn_right(); break;
+    case DRIVE_LEFT:     motors_turn_right(); break;
+    case DRIVE_RIGHT:    motors_turn_left();  break;
     case DRIVE_FORWARD:  motors_forward();    break;
     case DRIVE_BACKWARD: motors_backward();   break;
     case DRIVE_STOP:
