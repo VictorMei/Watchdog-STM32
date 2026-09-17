@@ -322,12 +322,15 @@ typedef struct
    800 ms is about 3-5 healthy frames at 320 px and still clears one frame at
    640 px, so it survives a dropped frame or a GC pause without ever masking a
    dead link: an unplugged cable or a killed vision process stops the wheels in
-   at most 800 ms + one control period. At the pivot/creep speeds this car
+   at most 4000 ms + one control period. At the pivot/creep speeds this car
    drives that is a short coast, not a runaway.
 
-   If the Pi's frame rate changes, re-check this against the runner's PERF line
-   (it prints the measured interval) and keep it at roughly 3-4x that. */
-#define FAILSAFE_TIMEOUT_MS   800U   /* older than this -> freeze in place (never re-centre) */
+   Sized for the Pi 4's measured ~1 FPS: at roughly one packet per second an
+   800 ms window expired between frames, so the follower spent most of its
+   time in the stale-vision STOP branch and the car never moved. If the Pi's
+   frame rate changes, re-check this against the runner's PERF line (it prints
+   the measured interval) and keep it at roughly 3-4x that. */
+#define FAILSAFE_TIMEOUT_MS   4000U  /* older than this -> freeze in place (never re-centre) */
 
 /* ---- Build-time switches -------------------------------------------------- */
 #define SERVO_SIGN_TEST       0      /* 1 = open-loop direction test at boot, vision ignored */
@@ -374,12 +377,22 @@ typedef struct
 #define MOTOR_RIGHT_REVERSED  0      /* 1 if ONLY the right wheel spins backward when driven forward */
 
 /* Bring-up test result: motors_forward()/backward() drove the car backward/
-   forward respectively, while motors_turn_left()/turn_right() already pivot
-   the correct way. That is NOT the same fault as one wheel being reversed -
-   turning depends on the two wheels disagreeing, straight-line motion
-   depends on them agreeing, so flipping MOTOR_LEFT/RIGHT_REVERSED together
-   would fix forward/backward but break the (already-correct) turns. This
-   flag swaps ONLY the straight-line functions and leaves turning alone. */
+   forward respectively. That is NOT the same fault as one wheel being
+   reversed - one wheel reversed makes the car spin instead of drive, whereas
+   BOTH wheels' electrical forward being physically backward is what makes
+   straight-line motion come out mirrored. Flipping MOTOR_LEFT/RIGHT_REVERSED
+   together would express the same thing, but those flags are documented as
+   per-wheel mounting facts, so this build keeps them at 0 and states the
+   chassis-level inversion once, here.
+
+   It applies to turning too. With both wheels inverted, the (LEFT=BWD,
+   RIGHT=FWD) pattern that pivots left on a normally-wired chassis comes out
+   as (LEFT physically FWD, RIGHT physically BWD) - a pivot RIGHT. The
+   original note here claimed turning was already correct; hardware testing of
+   autonomous following disproved that (a target to the LEFT pivoted the car
+   RIGHT), which is exactly what this flag predicts. So the flag now swaps the
+   turn helpers as well as the straight-line ones, and both stay consistent
+   with the single physical fact they encode. */
 #define MOTORS_FWD_BWD_SWAPPED 1
 
 #if LEFT_MOTOR_IS_MOTOR_A
@@ -433,7 +446,7 @@ typedef struct
 
    Decision priority, in this exact order (see vehicle_follow_update()):
        1. autonomous drive disabled        -> STOP
-       2. not homed / stale vision / not locked -> STOP
+       2. not homed / stale vision / not detected -> STOP
        3. target significantly LEFT        -> TURN LEFT
        4. target significantly RIGHT       -> TURN RIGHT
        5. centred and target still small   -> FORWARD
@@ -1145,22 +1158,39 @@ static void motors_backward(void)
              straight_dir, MOTOR_RIGHT_REVERSED);
 }
 
-/* Pivot left: left wheel backward, right wheel forward. */
+/* Pivot left: left wheel physically backward, right wheel physically forward.
+   MOTORS_FWD_BWD_SWAPPED inverts both sides, exactly as it does for
+   motors_forward()/backward() - see the flag's comment for why turning is
+   affected by the same chassis fact that straight-line motion is. */
 static void motors_turn_left(void)
 {
+#if MOTORS_FWD_BWD_SWAPPED
+  const motor_dir_t left_dir  = MOTOR_DIR_FWD;
+  const motor_dir_t right_dir = MOTOR_DIR_BWD;
+#else
+  const motor_dir_t left_dir  = MOTOR_DIR_BWD;
+  const motor_dir_t right_dir = MOTOR_DIR_FWD;
+#endif
   motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_LEFT_REVERSED);
+             left_dir, MOTOR_LEFT_REVERSED);
   motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_RIGHT_REVERSED);
+             right_dir, MOTOR_RIGHT_REVERSED);
 }
 
-/* Pivot right: left wheel forward, right wheel backward. */
+/* Pivot right: left wheel physically forward, right wheel physically backward. */
 static void motors_turn_right(void)
 {
+#if MOTORS_FWD_BWD_SWAPPED
+  const motor_dir_t left_dir  = MOTOR_DIR_BWD;
+  const motor_dir_t right_dir = MOTOR_DIR_FWD;
+#else
+  const motor_dir_t left_dir  = MOTOR_DIR_FWD;
+  const motor_dir_t right_dir = MOTOR_DIR_BWD;
+#endif
   motor_drive(MOTOR_LEFT_PORT_1,  MOTOR_LEFT_PIN_1,  MOTOR_LEFT_PORT_2,  MOTOR_LEFT_PIN_2,
-             MOTOR_DIR_FWD, MOTOR_LEFT_REVERSED);
+             left_dir, MOTOR_LEFT_REVERSED);
   motor_drive(MOTOR_RIGHT_PORT_1, MOTOR_RIGHT_PIN_1, MOTOR_RIGHT_PORT_2, MOTOR_RIGHT_PIN_2,
-             MOTOR_DIR_BWD, MOTOR_RIGHT_REVERSED);
+             right_dir, MOTOR_RIGHT_REVERSED);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1231,7 +1261,6 @@ static void vehicle_follow_update(uint32_t now)
 {
   vehicle_vision_t vis;
   uint8_t          detected;
-  uint8_t          locked;
 
   /* Priority 1: the feature is off. Hold the wheels stopped rather than simply
      returning, so this build actively parks the drivetrain instead of leaving
@@ -1247,7 +1276,7 @@ static void vehicle_follow_update(uint32_t now)
     return;
   }
 
-  /* Priority 2: anything short of a fresh, confidently locked target is a STOP.
+  /* Priority 2: anything short of a fresh, freshly-detected target is a STOP.
      The car must never drive on a guess.
 
      "Fresh" is checked on BOTH timestamps against the same FAILSAFE_TIMEOUT_MS
@@ -1259,9 +1288,15 @@ static void vehicle_follow_update(uint32_t now)
      covers "vision process exited": the flags simply stop being refreshed and
      this goes to STOP within one control period.
 
-     locked requires detected as well, exactly as status_leds_update() and
-     lcd_status_update() do, so a malformed locked-without-detected byte cannot
-     put the car in motion when the LEDs would call it "no target". */
+     DETECTED alone authorises movement. At the Pi 4's ~1 FPS, LOCKED costs an
+     extra whole second because the vision side only asserts it on the second
+     consecutive fresh detection, and waiting for it meant the car stood still
+     through the first second of every sighting. DETECTED is not a weaker
+     signal for this purpose: the vision side clears it on any frame that fails
+     to re-detect the selected target, and never sets it from a coasted or
+     stale frame, so it already means "seen on the most recent frame". LOCKED
+     remains the confirmation the green LED and the LCD report; it just no
+     longer gates the drivetrain. */
   if (!tracking_ready)
   {
     vehicle_drive_command(DRIVE_STOP);   /* still homing the servos */
@@ -1278,12 +1313,10 @@ static void vehicle_follow_update(uint32_t now)
   }
 
   detected = ((vis.flags & VISION_STATUS_DETECTED) != 0U) ? 1U : 0U;
-  locked   = ((detected != 0U) && ((vis.flags & VISION_STATUS_LOCKED) != 0U)) ? 1U : 0U;
 
-  if (!locked)
+  if (!detected)
   {
-    /* No target at all, or detected but not yet through the vision side's
-       consecutive-frame lock rule. Either way the car stays put. */
+    /* Nothing seen on the most recent fresh frame - the car stays put. */
     vehicle_drive_command(DRIVE_STOP);
     return;
   }
