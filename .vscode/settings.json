@@ -14,6 +14,7 @@
     ],
     "chat.tools.terminal.autoApprove": {
         "git remote": true,
-        "printf": true
+        "printf": true,
+        "git push": true
     }
 }
