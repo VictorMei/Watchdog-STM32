@@ -11,6 +11,11 @@ servos and motors.
 
 **Vision code (runs on the Pi/laptop):** https://github.com/tshiven/Watchdog_car
 
+<p align="center">
+  <img src="docs/images/watchdog-side.png" alt="Watchdog car - pan/tilt camera head" width="45%">
+  <img src="docs/images/watchdog-top.png" alt="Watchdog car - chassis, wiring and LCD" width="45%">
+</p>
+
 ## What it does
 
 - Two RC servos (pan + tilt) keep the camera pointed at the tracked target.
@@ -41,29 +46,6 @@ The two things vision sends over UART are:
 - MPU6050 IMU is wired to the same I2C1 bus but is not currently used by
   the firmware (see `lcd_i2c.c`'s notes) — it's reserved for a future
   stabilisation feature
-
-## Where to start reading
-
-If you're getting familiar with this codebase, read in this order:
-
-1. **`Core/Src/main.c`** — this is almost the whole project. Everything
-   that isn't boilerplate lives here: the UART packet parser, the pan/tilt
-   control loop, the autonomous drivetrain logic, and the LED/LCD status
-   code. It's heavily commented — the comments explain *why* each constant
-   has the value it does, not just what the code does.
-2. **`Core/Src/lcd_i2c.c`** / **`Core/Inc/lcd_i2c.h`** — a small, standalone
-   driver for the status LCD. Doesn't know anything about tracking; `main.c`
-   just tells it what text to show.
-3. **`Core/Src/stm32f1xx_hal_msp.c`** — pin/clock setup for each peripheral
-   (which GPIO pins map to which peripheral function). Useful if you're
-   rewiring something.
-4. **`Core/Src/stm32f1xx_it.c`** — interrupt vector table entries. The only
-   one that matters for this project is `USART2_IRQHandler`, which is what
-   actually triggers the byte-by-byte UART parsing in `main.c`.
-5. Everything else (`system_stm32f1xx.c`, `syscalls.c`, `sysmem.c`,
-   `stm32f1xx_hal_conf.h`, `Core/Startup/*`, `Drivers/`, `Middlewares/`) is
-   CubeMX-generated or vendor HAL/CMSIS code. You generally won't need to
-   touch it.
 
 ## Project structure
 
